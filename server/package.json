@@ -1,0 +1,9 @@
+{
+  "name": "encore-background-alerts",
+  "private": true,
+  "type": "module",
+  "description": "Scheduled check that sends Encore push notifications (run by .github/workflows/alerts.yml)",
+  "scripts": { "check": "node check.mjs" },
+  "dependencies": { "web-push": "3.6.7" },
+  "engines": { "node": ">=20" }
+}

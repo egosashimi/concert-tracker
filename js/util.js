@@ -163,10 +163,12 @@ export function placeLine(venue) {
 }
 
 // ---------- Platform ----------
-export const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
-  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const nav = typeof navigator !== 'undefined' ? navigator : {};
+export const isIOS = /iP(hone|ad|od)/.test(nav.userAgent || '') ||
+  (nav.platform === 'MacIntel' && nav.maxTouchPoints > 1);
 export const isStandalone = () =>
-  window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+  typeof window !== 'undefined' &&
+  (window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true);
 
 export function haptic() {
   try { navigator.vibrate?.(8); } catch { /* not supported on iOS */ }
@@ -193,4 +195,44 @@ export async function shareOrDownload(filename, text, mime) {
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 4000);
   return 'downloaded';
+}
+
+// ---------- Geohash (Ticketmaster's geoPoint filter) ----------
+const B32 = '0123456789bcdefghjkmnpqrstuvwxyz';
+export function geohash(lat, lon, precision = 9) {
+  let latR = [-90, 90];
+  let lonR = [-180, 180];
+  let hash = '';
+  let bit = 0;
+  let ch = 0;
+  let even = true;
+  while (hash.length < precision) {
+    const r = even ? lonR : latR;
+    const v = even ? lon : lat;
+    const mid = (r[0] + r[1]) / 2;
+    if (v >= mid) { ch = (ch << 1) | 1; r[0] = mid; } else { ch <<= 1; r[1] = mid; }
+    even = !even;
+    if (++bit === 5) { hash += B32[ch]; bit = 0; ch = 0; }
+  }
+  return hash;
+}
+
+// ---------- base64url ----------
+export function b64urlFromBytes(bytes) {
+  let s = '';
+  for (const b of new Uint8Array(bytes)) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+export function bytesFromB64url(str) {
+  const b64 = str.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((str.length + 3) % 4);
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+export function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }

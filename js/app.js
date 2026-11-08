@@ -5,6 +5,9 @@ import { refresh, isRefreshing } from './refresh.js';
 import { $, $$, isStandalone, todayStr, haptic } from './util.js';
 import { toast, sheetIsOpen, closeSheet } from './ui.js';
 import * as V from './views.js';
+import * as M from './views-more.js';
+import { syncEnabled, scheduleSync, syncNow } from './sync.js';
+import { handleSpotifyRedirect } from './spotify.js';
 
 const app = $('#app');
 let currentRoute = null;
@@ -51,6 +54,30 @@ function render({ scrollTop = false } = {}) {
     case 'artists':
       html = V.renderArtists();
       break;
+    case 'discover':
+      html = M.renderDiscover();
+      wire = () => M.wireDiscover(app, rerender);
+      break;
+    case 'place':
+      html = M.renderPlace(route.id);
+      wire = () => M.wirePlace(app, route.id, go);
+      break;
+    case 'import':
+      if (route.params.get('artists')) {
+        M.setImportCandidates(M.parseArtistText(route.params.get('artists')), 'Link');
+        history.replaceState(null, '', '#/import');
+      }
+      html = M.renderImport();
+      wire = () => M.wireImport(app, rerender);
+      break;
+    case 'stats':
+      html = M.renderStats();
+      wire = () => M.wireStats(app, rerender);
+      break;
+    case 'tonight':
+      html = M.renderTonight(route.id);
+      wire = () => M.wireTonight(app, route.id);
+      break;
     case 'artist':
       html = V.renderArtist(route.id);
       break;
@@ -70,7 +97,7 @@ function render({ scrollTop = false } = {}) {
   app.innerHTML = html;
   wire();
 
-  const tab = { artist: 'artists', event: 'shows' }[route.name] || route.name;
+  const tab = { artist: 'artists', event: 'shows', import: 'artists', place: 'discover', stats: 'calendar', tonight: 'shows' }[route.name] || route.name;
   $$('.tabbar .tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === tab));
   updateBadge();
 
@@ -95,7 +122,7 @@ function render({ scrollTop = false } = {}) {
 
 function updateBadge() {
   const today = todayStr();
-  const n = Object.values(getState().events).filter((e) => e.isNew && !e.mine?.hidden && (!e.date || e.date >= today)).length;
+  const n = Object.values(getState().events).filter((e) => e.isNew && e.artistIds?.length && !e.mine?.hidden && (!e.date || e.date >= today)).length;
   const b = $('#badge-shows');
   b.hidden = !n;
   b.textContent = n > 99 ? '99+' : String(n);
@@ -106,8 +133,9 @@ function updateBadge() {
 
 // Re-render whenever data changes (unless a sheet is open — it'll render on close).
 let pendingRender = false;
-subscribe(() => {
+subscribe((st) => {
   applyTheme();
+  if (syncEnabled() && st.updatedAt > (st.settings.sync?.base || 0)) scheduleSync();
   if (pendingRender) return;
   pendingRender = true;
   requestAnimationFrame(() => {
@@ -127,10 +155,13 @@ document.addEventListener('click', async (e) => {
   switch (action) {
     case 'back':
       if (navDepth > 0 && history.length > 1) history.back();
-      else go(route.name === 'event' ? '#/shows' : '#/artists', true);
+      else go({ event: '#/shows', tonight: '#/shows', place: '#/discover', stats: '#/calendar' }[route.name] || '#/artists', true);
       break;
     case 'refresh':
-      doRefresh({ artistId: route.name === 'artist' ? route.id : null, manual: true });
+      doRefresh({ artistId: route.name === 'artist' ? route.id : null, placeId: route.name === 'place' ? route.id : null, manual: true });
+      break;
+    case 'add-place':
+      M.openAddPlace(el.dataset.kind || 'venue');
       break;
     case 'add-artist':
       V.openAddArtist();
@@ -142,7 +173,7 @@ document.addEventListener('click', async (e) => {
       break;
     }
     case 'add-show':
-      V.openShowForm({ artistId: el.dataset.artist || (route.name === 'artist' ? route.id : null) });
+      V.openShowForm({ artistId: el.dataset.artist || (route.name === 'artist' ? route.id : null), status: route.name === 'stats' ? 'going' : '' });
       break;
     case 'edit-show':
       V.openShowForm({ eventId: route.id });
@@ -182,14 +213,14 @@ document.addEventListener('click', async (e) => {
     }
     case 'export-mine-ics':
     case 'export-all-ics': {
-      const evs = V.upcomingEvents().filter((x) => (action === 'export-mine-ics' ? ['going', 'tickets'] : ['interested', 'going', 'tickets']).includes(x.mine?.status));
+      const evs = V.myUpcoming().filter((x) => (action === 'export-mine-ics' ? ['going', 'tickets'] : ['interested', 'going', 'tickets']).includes(x.mine?.status));
       V.exportICS(evs, 'encore-shows.ics');
       break;
     }
     case 'toggle-hide':
       update((s) => {
         const ev = s.events[route.id];
-        if (ev) ev.mine = { ...(ev.mine || {}), hidden: !ev.mine?.hidden };
+        if (ev) V.touchMine(ev).hidden = !ev.mine?.hidden;
       });
       break;
     case 'cal-prev':
@@ -221,13 +252,13 @@ document.addEventListener('click', async (e) => {
 });
 
 // ---------------- Refresh ----------------
-async function doRefresh({ artistId = null, manual = false } = {}) {
+async function doRefresh({ artistId = null, placeId = null, manual = false } = {}) {
   const s = getState();
-  if (!s.settings.tmKey && !s.settings.bitAppId) {
+  if (!s.settings.tmKey && !s.settings.bitAppId && !s.settings.sgClientId) {
     if (manual) toast('Add a Ticketmaster API key in Settings to fetch shows.', { ms: 3500 });
     return;
   }
-  if (!s.artists.length) {
+  if (!s.artists.length && !s.places?.length) {
     if (manual) toast('Add an artist first');
     return;
   }
@@ -236,11 +267,12 @@ async function doRefresh({ artistId = null, manual = false } = {}) {
     if (manual) toast('You are offline', { error: true });
     return;
   }
-  V.ui.refreshProgress = { done: 0, total: artistId ? 1 : s.artists.length, name: '' };
+  V.ui.refreshProgress = { done: 0, total: artistId || placeId ? 1 : s.artists.length + (s.settings.tmKey ? s.places.length : 0), name: '' };
   render();
   try {
     const res = await refresh({
       artistId,
+      placeId,
       onProgress: (done, total, name) => {
         V.ui.refreshProgress = { done, total, name };
         const bar = $('.progress > div');
@@ -265,19 +297,28 @@ async function doRefresh({ artistId = null, manual = false } = {}) {
   }
 }
 
-window.addEventListener('encore:refresh', (e) => doRefresh({ artistId: e.detail?.artistId || null }));
+window.addEventListener('encore:refresh', (e) => doRefresh({ artistId: e.detail?.artistId || null, placeId: e.detail?.placeId || null }));
 
 function autoRefreshIfStale() {
   const s = getState();
   const hours = +s.settings.autoRefreshHours;
-  if (!hours || !s.artists.length) return;
+  if (!hours || (!s.artists.length && !s.places?.length)) return;
   if (Date.now() - (s.lastRefresh || 0) > hours * 3600000) doRefresh();
+}
+
+async function syncThenRefresh() {
+  if (syncEnabled()) {
+    try { await syncNow(); } catch (e) { console.warn('Sync failed', e); }
+  }
+  autoRefreshIfStale();
 }
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
-    autoRefreshIfStale();
+    syncThenRefresh();
     render();
+  } else if (syncEnabled() && getState().updatedAt > getState().settings.sync.base) {
+    syncNow().catch(() => {});
   }
 });
 window.addEventListener('online', () => autoRefreshIfStale());
@@ -288,7 +329,7 @@ window.addEventListener('online', () => autoRefreshIfStale());
   let startY = null;
   let dy = 0;
   const threshold = 70;
-  const routeOk = () => ['shows', 'artist', 'artists', 'calendar'].includes(parseRoute().name);
+  const routeOk = () => ['shows', 'artist', 'artists', 'calendar', 'discover', 'place'].includes(parseRoute().name);
   window.addEventListener('touchstart', (e) => {
     if (window.scrollY > 0 || sheetIsOpen() || !routeOk() || isRefreshing()) { startY = null; return; }
     startY = e.touches[0].clientY;
@@ -312,7 +353,7 @@ window.addEventListener('online', () => autoRefreshIfStale());
       ptr.classList.add('loading');
       ptr.style.transform = 'translateY(36px)';
       const r = parseRoute();
-      await doRefresh({ artistId: r.name === 'artist' ? r.id : null, manual: true });
+      await doRefresh({ artistId: r.name === 'artist' ? r.id : null, placeId: r.name === 'place' ? r.id : null, manual: true });
       ptr.classList.remove('loading');
     }
     ptr.style.transform = 'translateY(-60px)';
@@ -352,8 +393,23 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   });
 }
 
+// Tapping a background-alert notification while the app is open.
+navigator.serviceWorker?.addEventListener('message', (e) => {
+  if (e.data?.type === 'open' && e.data.url) location.hash = e.data.url.replace(/^.*#/, '#');
+});
+
 // ---------------- Boot ----------------
 applyTheme();
 render();
 if (isStandalone()) requestPersistence();
-setTimeout(autoRefreshIfStale, 600);
+handleSpotifyRedirect().then((r) => {
+  if (!r) return;
+  M.setImportCandidates(r.artists, 'Spotify', { handoff: r.handoff });
+  location.hash = '#/import';
+  render();
+  toast(`Found ${r.artists.length} artists on Spotify`);
+}).catch((e) => {
+  location.hash = '#/import';
+  toast(e.message, { error: true, ms: 4500 });
+});
+setTimeout(syncThenRefresh, 600);

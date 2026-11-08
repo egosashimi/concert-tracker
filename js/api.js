@@ -1,9 +1,11 @@
 // Data sources. Everything is called directly from the phone; keys are stored only on the device.
 //  - Ticketmaster Discovery API v2: artist search, events, price ranges, on-sale dates. Free key.
 //  - Bandsintown (optional): extra tour dates, no prices. Requires an app_id.
+//  - SeatGeek (optional): resale listing prices. Requires a client_id.
 //  - Open-Meteo geocoding: turn a city name into coordinates. No key.
+// This module also runs in Node (the background-alert GitHub Action), so it avoids browser-only APIs.
 
-import { sleep } from './util.js';
+import { sleep, geohash, todayStr, normalizeName, distanceMi } from './util.js';
 
 const TM = 'https://app.ticketmaster.com/discovery/v2';
 
@@ -20,7 +22,7 @@ async function getJSON(url, { retries = 2 } = {}) {
   try {
     res = await fetch(url, { headers: { Accept: 'application/json' } });
   } catch {
-    throw new ApiError(navigator.onLine === false ? 'You are offline.' : 'Network error — could not reach the server.');
+    throw new ApiError(typeof navigator !== 'undefined' && navigator.onLine === false ? 'You are offline.' : 'Network error — could not reach the server.');
   }
   if (res.status === 429 && retries > 0) {
     await sleep(1200);
@@ -56,6 +58,16 @@ async function tm(path, params, key) {
   }
 }
 
+function classIds(c) {
+  const ok = (x) => x && x.id && x.name !== 'Undefined' && x.name !== 'Other';
+  return {
+    genreId: ok(c?.genre) ? c.genre.id : '',
+    subGenreId: ok(c?.subGenre) ? c.subGenre.id : '',
+    genre: ok(c?.genre) ? c.genre.name : '',
+    subGenre: ok(c?.subGenre) ? c.subGenre.name : '',
+  };
+}
+
 function pickImage(images, { ratio = '16_9', minWidth = 500 } = {}) {
   if (!Array.isArray(images) || !images.length) return '';
   const good = images
@@ -79,6 +91,7 @@ export async function tmSearchArtists(query, key) {
       .filter((g) => g && g !== 'Undefined' && g !== 'Other')
       .filter((g, i, arr) => arr.indexOf(g) === i)
       .join(' · '),
+    ...classIds(a.classifications?.[0]),
     upcoming: a.upcomingEvents?._total ?? a.upcomingEvents?.ticketmaster ?? 0,
     url: a.url || '',
     links: a.externalLinks || {},
@@ -150,6 +163,14 @@ export function normalizeTmEvent(e) {
     currency: ranges[0]?.currency || 'USD',
     image: pickImage(e.images, { minWidth: 600 }),
     lineup: (e._embedded?.attractions || []).map((a) => a.name).filter(Boolean),
+    attractions: (e._embedded?.attractions || []).map((a) => ({
+      tmId: a.id,
+      name: a.name,
+      image: pickImage(a.images, { ratio: '1_1', minWidth: 100 }) || pickImage(a.images, { minWidth: 200 }),
+      ...classIds(a.classifications?.[0]),
+    })),
+    venueId: v.id || '',
+    doorsTime: e.doorsTimes?.localTime || '',
     info: [e.info, e.pleaseNote].filter(Boolean).join('\n\n'),
     ticketLimit: e.ticketLimit?.info || '',
     ageRestricted: !!e.ageRestrictions?.legalAgeEnforced,
@@ -209,6 +230,9 @@ export function normalizeBitEvent(e) {
     currency: 'USD',
     image: '',
     lineup: e.lineup || [],
+    attractions: [],
+    venueId: '',
+    doorsTime: '',
     info: e.description || '',
     ticketLimit: '',
     ageRestricted: false,
@@ -253,3 +277,141 @@ export async function reverseLabel(lat, lon) {
   // Open-Meteo has no reverse geocoder; show rounded coordinates instead.
   return `Near ${lat.toFixed(2)}, ${lon.toFixed(2)}`;
 }
+
+// ---------------- Ticketmaster: venues, areas, suggestions ----------------
+export async function tmSearchVenues(query, key, countryCode) {
+  const data = await tm('/venues.json', { keyword: query, size: 20, countryCode: countryCode || undefined, sort: 'relevance,desc' }, key);
+  return (data?._embedded?.venues || []).map((v) => ({
+    tmVenueId: v.id,
+    name: v.name,
+    city: v.city?.name || '',
+    region: v.state?.stateCode || v.state?.name || '',
+    country: v.country?.countryCode || '',
+    lat: num(v.location?.latitude),
+    lon: num(v.location?.longitude),
+    upcoming: v.upcomingEvents?._total ?? 0,
+  }));
+}
+
+/** Music events at a followed venue, or within an area's radius (next `days` days). */
+export async function tmPlaceEvents(place, key, { days = 90, pages = 2 } = {}) {
+  const end = new Date(Date.now() + days * 86400000).toISOString().replace(/\.\d+Z$/, 'Z');
+  const params = place.kind === 'venue'
+    ? { venueId: place.tmVenueId }
+    : { geoPoint: geohash(place.lat, place.lon, 7), radius: Math.round(place.radius || 25), unit: 'miles', endDateTime: end };
+  const all = [];
+  for (let page = 0; page < pages; page++) {
+    const data = await tm('/events.json', { ...params, classificationName: 'music', size: 100, page, sort: 'date,asc' }, key);
+    all.push(...(data?._embedded?.events || []));
+    if (page + 1 >= (data?.page?.totalPages || 0)) break;
+    await sleep(220);
+  }
+  return all.map(normalizeTmEvent);
+}
+
+/** Upcoming music events near a point in the given genres — used for artist suggestions. */
+export async function tmGenreEventsNear({ lat, lon, radius, genreIds = [], subGenreIds = [] }, key) {
+  const end = new Date(Date.now() + 120 * 86400000).toISOString().replace(/\.\d+Z$/, 'Z');
+  const data = await tm('/events.json', {
+    geoPoint: geohash(lat, lon, 7),
+    radius: Math.round(radius || 100),
+    unit: 'miles',
+    classificationName: 'music',
+    subGenreId: subGenreIds.slice(0, 8).join(',') || undefined,
+    genreId: subGenreIds.length ? undefined : genreIds.slice(0, 5).join(',') || undefined,
+    endDateTime: end,
+    size: 150,
+    sort: 'date,asc',
+  }, key);
+  return (data?._embedded?.events || []).map(normalizeTmEvent);
+}
+
+// ---------------- SeatGeek (resale prices) ----------------
+const SG = 'https://api.seatgeek.com/2';
+
+async function sg(path, params, clientId) {
+  const url = new URL(SG + path);
+  for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== '') url.searchParams.set(k, v);
+  url.searchParams.set('client_id', clientId);
+  try {
+    return await getJSON(url.toString());
+  } catch (e) {
+    if (e.status === 401 || e.status === 403) throw new ApiError('SeatGeek rejected the client ID.', { fatal: true, status: e.status });
+    throw e;
+  }
+}
+
+export async function sgFindPerformer(name, clientId) {
+  const data = await sg('/performers', { q: name, per_page: 10 }, clientId);
+  const list = data?.performers || [];
+  const n = normalizeName(name);
+  return list.find((p) => normalizeName(p.name) === n) || null;
+}
+
+export async function sgPerformerEvents(performerId, clientId) {
+  const data = await sg('/events', { 'performers.id': performerId, per_page: 100, sort: 'datetime_local.asc' }, clientId);
+  return (data?.events || []).map(normalizeSgEvent);
+}
+
+export function normalizeSgEvent(e) {
+  const v = e.venue || {};
+  const st = e.stats || {};
+  const dt = String(e.datetime_local || '');
+  const tba = e.date_tbd || e.datetime_tbd;
+  return {
+    id: `sg_${e.id}`,
+    source: 'sg',
+    name: e.title || e.short_title || '',
+    date: dt.slice(0, 10) || null,
+    time: tba || e.time_tbd ? null : (dt.slice(11, 19) || null),
+    dateTime: e.datetime_utc ? `${e.datetime_utc}Z` : null,
+    timezone: v.timezone || '',
+    status: 'onsale',
+    venue: {
+      name: v.name || '',
+      city: v.city || '',
+      region: v.state || '',
+      country: v.country === 'US' || v.country === 'United States' ? 'US' : (v.country || ''),
+      address: [v.address, v.extended_address].filter(Boolean).join(', '),
+      lat: num(v.location?.lat),
+      lon: num(v.location?.lon),
+    },
+    url: e.url || '',
+    onSale: '',
+    offSale: '',
+    presales: [],
+    priceMin: null,
+    priceMax: null,
+    currency: 'USD',
+    image: e.performers?.[0]?.image || '',
+    lineup: (e.performers || []).map((p) => p.name),
+    attractions: [],
+    venueId: '',
+    doorsTime: '',
+    info: '',
+    ticketLimit: '',
+    ageRestricted: false,
+    resale: resaleFromStats(st, e.url),
+  };
+}
+
+function resaleFromStats(st, url) {
+  const min = num(st.lowest_price);
+  if (min == null || !(st.listing_count > 0)) return null;
+  return { min, avg: num(st.average_price), max: num(st.highest_price), count: st.listing_count || 0, url: url || '', src: 'SeatGeek' };
+}
+
+/** Is `b` the same concert as `a`? Same date and same city / nearby venue. */
+export function sameShow(a, b) {
+  if (!a.date || !b.date || a.date !== b.date) return false;
+  const d = distanceMi(a.venue, b.venue);
+  if (d != null) return d < 15;
+  const ca = normalizeName(a.venue?.city);
+  const cb = normalizeName(b.venue?.city);
+  if (ca && cb && ca === cb) return true;
+  const va = normalizeName(a.venue?.name);
+  const vb = normalizeName(b.venue?.name);
+  return !!va && !!vb && (va.includes(vb) || vb.includes(va));
+}
+
+export { todayStr };

@@ -2,7 +2,7 @@
 
 import { esc, fmtMoney, fmtPriceRange, parseLocalDate, placeLine, distanceMi, fmtDistance, daysUntil, fmtTime, initials } from './util.js';
 import { getState } from './store.js';
-import { STATUS_LABEL, artistNames, lowestKnownPrice } from './refresh.js';
+import { STATUS_LABEL, eventName, lowestKnownPrice } from './refresh.js';
 
 // ---------- Icons (inline SVG, stroke-based) ----------
 const P = {
@@ -37,6 +37,15 @@ const P = {
   sort: '<path d="M7 4v16M3 16l4 4 4-4M17 20V4M13 8l4-4 4 4"/>',
   download: '<path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 21h14"/>',
   upload: '<path d="M12 15V3M7 8l5-5 5 5"/><path d="M5 21h14"/>',
+  compass: '<circle cx="12" cy="12" r="9"/><path d="M15.5 8.5l-2 5-5 2 2-5z"/>',
+  chart: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+  clip: '<path d="M21 11.5l-8.6 8.6a5 5 0 0 1-7.1-7.1l8.6-8.6a3.3 3.3 0 0 1 4.7 4.7l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9"/>',
+  file: '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/>',
+  cloud: '<path d="M7 18a5 5 0 1 1 .9-9.9A6 6 0 0 1 19 10a4 4 0 0 1 0 8z"/>',
+  building: '<path d="M4 21V5l8-3 8 3v16"/><path d="M9 21v-4h6v4M8 8h.01M12 8h.01M16 8h.01M8 12h.01M12 12h.01M16 12h.01"/>',
+  spark: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8"/>',
+  moon: '<path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
 };
 export const icon = (name, cls = '') => `<svg viewBox="0 0 24 24" class="${cls}" aria-hidden="true">${P[name] || ''}</svg>`;
 
@@ -145,8 +154,16 @@ export function confirmSheet({ title, message, confirm = 'Confirm', danger = fal
 
 // ---------- Show helpers ----------
 export function eventTitle(ev) {
-  const names = artistNames(ev);
-  return names.length ? names.join(' & ') : ev.name || 'Concert';
+  return eventName(ev);
+}
+
+/** Where the lowest price comes from: 'face' | 'resale' | 'manual'. */
+export function lowSource(ev) {
+  const low = lowestKnownPrice(ev);
+  if (low == null) return null;
+  if (ev.priceMin === low) return 'face';
+  if (ev.resale && !ev.resale.gone && ev.resale.min === low) return 'resale';
+  return 'manual';
 }
 
 export function eventDistance(ev) {
@@ -223,7 +240,7 @@ export function showCard(ev, { showArtist = true } = {}) {
         ? `<span class="drop">▼ ${esc(fmtMoney(ev.priceChange.from - ev.priceChange.to, ev.currency))}</span>`
         : `<span class="rise">▲ ${esc(fmtMoney(ev.priceChange.to - ev.priceChange.from, ev.currency))}</span>`;
     }
-    priceHtml = `<span>from</span><b>${esc(fmtMoney(low, ev.currency))}</b>${change}`;
+    priceHtml = `<span>${lowSource(ev) === 'resale' ? 'resale' : 'from'}</span><b>${esc(fmtMoney(low, ev.currency))}</b>${change}`;
   }
   const cls = ['show-card', m.status ? `mine-${m.status}` : '', isCancelled(ev) ? 'cancelled dim' : '', m.hidden ? 'dim' : ''].join(' ');
   return `<a class="${cls}" href="#/event/${encodeURIComponent(ev.id)}">
@@ -267,77 +284,6 @@ export function sortEvents(list) {
     if (!a.date) return 1;
     if (!b.date) return -1;
     return a.date.localeCompare(b.date) || String(a.time || '').localeCompare(String(b.time || ''));
-  });
-}
-
-// ---------- Price chart ----------
-// Single-series step chart of the lowest listed price over time; manual entries are hollow markers.
-export function priceChart(ev) {
-  const pts = (ev.priceHistory || [])
-    .filter((h) => h.min != null)
-    .sort((a, b) => a.t - b.t);
-  if (pts.length < 2) return '';
-  const target = ev.mine?.targetPrice;
-  const W = 340;
-  const H = 120;
-  const padL = 40;
-  const padR = 10;
-  const padT = 10;
-  const padB = 22;
-  const vals = pts.map((p) => p.min).concat(target != null ? [target] : []);
-  let lo = Math.min(...vals);
-  let hi = Math.max(...vals);
-  if (hi - lo < 1) { hi += 5; lo = Math.max(0, lo - 5); }
-  const pad = (hi - lo) * 0.12;
-  lo = Math.max(0, lo - pad);
-  hi += pad;
-  const t0 = pts[0].t;
-  const t1 = Math.max(pts[pts.length - 1].t, Date.now());
-  const x = (t) => padL + ((t - t0) / Math.max(1, t1 - t0)) * (W - padL - padR);
-  const y = (v) => padT + (1 - (v - lo) / (hi - lo)) * (H - padT - padB);
-  let d = `M${x(pts[0].t).toFixed(1)},${y(pts[0].min).toFixed(1)}`;
-  for (let i = 1; i < pts.length; i++) {
-    d += ` H${x(pts[i].t).toFixed(1)} V${y(pts[i].min).toFixed(1)}`;
-  }
-  d += ` H${x(t1).toFixed(1)}`;
-  const area = `${d} V${H - padB} H${padL} Z`;
-  const cur = ev.currency;
-  const ticks = [hi, (hi + lo) / 2, lo];
-  const fmtD = (t) => new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-  const grid = ticks.map((v) => `<line class="grid" x1="${padL}" x2="${W - padR}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}"/>
-    <text x="${padL - 6}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end">${esc(fmtMoney(Math.round(v), cur))}</text>`).join('');
-  const dots = pts.map((p, i) => `<circle class="pt ${p.src === 'manual' ? 'manual' : ''}" cx="${x(p.t).toFixed(1)}" cy="${y(p.min).toFixed(1)}" r="4"/>
-    <circle class="hit" data-i="${i}" cx="${x(p.t).toFixed(1)}" cy="${y(p.min).toFixed(1)}" r="16"/>`).join('');
-  const targetLine = target != null
-    ? `<line class="target" x1="${padL}" x2="${W - padR}" y1="${y(target).toFixed(1)}" y2="${y(target).toFixed(1)}"/>`
-    : '';
-  const tips = pts.map((p) => `${fmtD(p.t)} — ${fmtPriceRange(p.min, p.max, cur)}${p.src === 'manual' ? ` (you logged${p.note ? `: ${p.note}` : ''})` : ' (Ticketmaster)'}`);
-  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Lowest price over time" data-tips='${esc(JSON.stringify(tips))}'>
-    ${grid}
-    <path class="area" d="${area}"/>
-    <path class="line" d="${d}"/>
-    ${targetLine}
-    ${dots}
-    <text x="${padL}" y="${H - 6}">${esc(fmtD(t0))}</text>
-    <text x="${W - padR}" y="${H - 6}" text-anchor="end">Today</text>
-  </svg>
-  <div class="spark-tip" data-spark-tip>Tap a point for details.</div>
-  <div class="legend"><span><i class="api"></i>Ticketmaster</span><span><i class="manual"></i>Logged by you</span>${target != null ? '<span><i class="target"></i>Your target</span>' : ''}</div>`;
-}
-
-export function wireChart(root) {
-  const svg = root.querySelector('svg.spark');
-  if (!svg) return;
-  const tip = root.querySelector('[data-spark-tip]');
-  let tips = [];
-  try { tips = JSON.parse(svg.dataset.tips); } catch { /* ignore */ }
-  svg.addEventListener('click', (e) => {
-    const hit = e.target.closest('.hit');
-    if (hit && tip) tip.textContent = tips[+hit.dataset.i] || '';
-  });
-  svg.addEventListener('mouseover', (e) => {
-    const hit = e.target.closest('.hit');
-    if (hit && tip) tip.textContent = tips[+hit.dataset.i] || '';
   });
 }
 

@@ -1,9 +1,11 @@
-// Pull fresh data for tracked artists and merge it into local state:
-// detects new shows, price changes, status changes (cancelled / rescheduled), and price alerts.
+// Pull fresh data for followed artists, venues and areas, then merge it into local state:
+// detects new shows, face-value and resale price changes, status changes, and price-target alerts.
 
 import { getState, update } from './store.js';
-import { tmArtistEvents, bitArtistEvents, ApiError } from './api.js';
-import { normalizeName, sleep, todayStr, fmtMoney } from './util.js';
+import {
+  tmArtistEvents, bitArtistEvents, tmPlaceEvents, sgFindPerformer, sgPerformerEvents, sameShow, ApiError,
+} from './api.js';
+import { sleep, todayStr, fmtMoney } from './util.js';
 
 export const STATUS_LABEL = {
   onsale: 'On sale',
@@ -16,128 +18,182 @@ export const STATUS_LABEL = {
 };
 
 export function emptyMine() {
-  return { status: '', hidden: false, targetPrice: null, notes: '', qty: null, paid: null, seats: '' };
+  return { status: '', hidden: false, targetPrice: null, notes: '', qty: null, paid: null, seats: '', doors: '', files: [], t: 0 };
 }
 
 let running = null;
 export const isRefreshing = () => !!running;
 
 /**
- * Refresh all artists (or one). onProgress(done, total, artistName) is called as it goes.
- * Resolves to { newShows, priceDrops, alerts, errors, checked }.
+ * Refresh everything, one artist, or one place. onProgress(done, total, label) is called as it goes.
+ * Resolves to { newShows, priceDrops, alerts, statusChanges, errors, checked }.
  */
-export function refresh({ artistId = null, onProgress } = {}) {
+export function refresh({ artistId = null, placeId = null, onProgress } = {}) {
   if (running) return running;
-  running = doRefresh({ artistId, onProgress }).finally(() => { running = null; });
+  running = doRefresh({ artistId, placeId, onProgress }).finally(() => { running = null; });
   return running;
 }
 
-async function doRefresh({ artistId, onProgress }) {
+async function doRefresh({ artistId, placeId, onProgress }) {
   const s = getState();
-  const { tmKey, bitAppId, countryCode } = s.settings;
-  const artists = s.artists.filter((a) => !artistId || a.id === artistId);
+  const { tmKey, bitAppId, sgClientId, countryCode } = s.settings;
+  const all = !artistId && !placeId;
+  const artists = placeId ? [] : s.artists.filter((a) => !artistId || a.id === artistId);
+  const places = artistId ? [] : (s.places || []).filter((p) => !placeId || p.id === placeId);
   const summary = { newShows: [], priceDrops: [], alerts: [], statusChanges: [], errors: [], checked: 0 };
-  if (!tmKey && !bitAppId) {
+  if (!tmKey && !bitAppId && !sgClientId) {
     summary.errors.push('Add a Ticketmaster API key in Settings to look up shows automatically.');
     return summary;
   }
 
+  const total = artists.length + (tmKey ? places.length : 0);
+  let done = 0;
   const results = [];
-  let fatal = false;
-  for (let i = 0; i < artists.length && !fatal; i++) {
-    const a = artists[i];
-    onProgress?.(i, artists.length, a.name);
-    const res = { artistId: a.id, bySource: {}, error: '' };
-    if (tmKey && a.tmId) {
+  let tmDead = !tmKey;
+  let sgDead = !sgClientId;
+
+  for (const a of artists) {
+    onProgress?.(done, total, a.name);
+    const res = { owner: { kind: 'artist', id: a.id }, bySource: {}, error: '', patch: {} };
+    if (!tmDead && a.tmId) {
       try {
         res.bySource.tm = await tmArtistEvents(a.tmId, tmKey, countryCode);
       } catch (e) {
         res.error = e.message;
-        if (e instanceof ApiError && e.fatal) { fatal = true; summary.errors.push(e.message); }
+        if (e instanceof ApiError && e.fatal) { tmDead = true; summary.errors.push(e.message); }
       }
       await sleep(230);
     }
-    if (bitAppId && !fatal) {
+    if (bitAppId) {
       try {
         res.bySource.bit = await bitArtistEvents(a.bitName || a.name, bitAppId);
       } catch (e) {
         if (!res.error) res.error = e.message;
       }
     }
-    if (res.error && !fatal) summary.errors.push(`${a.name}: ${res.error}`);
+    if (!sgDead) {
+      try {
+        let sgId = a.sgId;
+        if (!sgId && Date.now() - (a.sgChecked || 0) > 7 * 86400000) {
+          const p = await sgFindPerformer(a.name, sgClientId);
+          sgId = p ? String(p.id) : '';
+          res.patch.sgId = sgId;
+          res.patch.sgChecked = Date.now();
+        }
+        if (sgId) res.bySource.sg = await sgPerformerEvents(sgId, sgClientId);
+      } catch (e) {
+        if (e instanceof ApiError && e.fatal) { sgDead = true; summary.errors.push(e.message); }
+        else if (!res.error) res.error = `SeatGeek: ${e.message}`;
+      }
+    }
+    if (res.error && !summary.errors.includes(res.error)) summary.errors.push(`${a.name}: ${res.error}`);
     results.push(res);
+    done++;
   }
-  onProgress?.(artists.length, artists.length, '');
+
+  for (const p of places) {
+    if (tmDead) break;
+    onProgress?.(done, total, p.name);
+    const res = { owner: { kind: 'place', id: p.id }, bySource: {}, error: '', patch: {} };
+    try {
+      res.bySource.tm = await tmPlaceEvents(p, tmKey);
+    } catch (e) {
+      res.error = e.message;
+      if (e instanceof ApiError && e.fatal) tmDead = true;
+      summary.errors.push(`${p.name}: ${e.message}`);
+    }
+    results.push(res);
+    done++;
+    await sleep(230);
+  }
+  onProgress?.(total, total, '');
 
   const now = Date.now();
   update((st) => {
     for (const r of results) {
-      const artist = st.artists.find((x) => x.id === r.artistId);
-      if (!artist) continue; // removed mid-refresh
-      const firstCheck = !artist.lastChecked;
-      for (const [source, events] of Object.entries(r.bySource)) {
-        mergeEvents(st, artist, source, events, now, firstCheck, summary);
+      const list = r.owner.kind === 'artist' ? st.artists : st.places;
+      const owner = list.find((x) => x.id === r.owner.id);
+      if (!owner) continue; // removed mid-refresh
+      Object.assign(owner, r.patch);
+      const firstCheck = !owner.lastChecked;
+      // Primary sources first so secondary listings fold into them.
+      for (const source of ['tm', 'bit', 'sg']) {
+        if (r.bySource[source]) mergeEvents(st, r.owner.kind, owner, source, r.bySource[source], now, firstCheck, summary);
       }
       if (Object.keys(r.bySource).length) {
-        artist.lastChecked = now;
+        owner.lastChecked = now;
         summary.checked++;
       }
-      artist.lastError = r.error || '';
+      owner.lastError = r.error || '';
     }
-    if (!artistId && summary.checked) st.lastRefresh = now;
-    prunePast(st);
+    if (all && summary.checked) st.lastRefresh = now;
+    prune(st);
   });
 
+  for (const k of ['newShows', 'priceDrops', 'alerts', 'statusChanges']) {
+    summary[k] = [...new Map(summary[k].map((e) => [e.id, e])).values()];
+  }
   await maybeNotify(summary);
   return summary;
 }
 
-function sameShow(a, b) {
-  if (!a.date || !b.date || a.date !== b.date) return false;
-  const ca = normalizeName(a.venue?.city);
-  const cb = normalizeName(b.venue?.city);
-  if (ca && cb && ca === cb) return true;
-  const va = normalizeName(a.venue?.name);
-  const vb = normalizeName(b.venue?.name);
-  return !!va && !!vb && (va.includes(vb) || vb.includes(va));
+function newEvent(ev, now) {
+  return {
+    ...ev,
+    artistIds: [],
+    placeIds: [],
+    firstSeen: now,
+    lastSeen: now,
+    isNew: false,
+    delisted: false,
+    priceHistory: [],
+    priceChange: null,
+    statusChange: null,
+    altUrls: {},
+    mine: emptyMine(),
+  };
 }
 
-function mergeEvents(st, artist, source, incoming, now, firstCheck, summary) {
+function mergeEvents(st, kind, owner, source, incoming, now, firstCheck, summary) {
+  const key = kind === 'artist' ? 'artistIds' : 'placeIds';
   const seen = new Set();
+  const today = todayStr();
+
   for (const ev of incoming) {
     let target = st.events[ev.id];
+    if (st.deleted?.events?.[ev.id]) continue;
 
-    // Bandsintown often duplicates Ticketmaster listings — fold those in.
-    if (!target && source === 'bit') {
-      const dup = Object.values(st.events).find((x) => x.source !== 'bit' && x.artistIds?.includes(artist.id) && sameShow(x, ev));
+    // Bandsintown and SeatGeek often list the same show as Ticketmaster — fold those in.
+    if (!target && source !== 'tm') {
+      const dup = Object.values(st.events).find((x) => x.source !== source && x[key]?.includes(owner.id) && sameShow(x, ev));
       if (dup) {
-        dup.altUrls = { ...(dup.altUrls || {}), bit: ev.url };
-        dup.lastSeen = now;
+        const before = lowestKnownPrice(dup);
+        dup.altUrls = { ...(dup.altUrls || {}), [source]: ev.url };
+        if (source === 'sg') trackResale(dup, ev.resale, now);
+        noteChange(dup, before, now, summary);
+        checkTarget(dup, now, summary);
         seen.add(dup.id);
         continue;
       }
     }
 
     if (!target) {
-      target = {
-        ...ev,
-        artistIds: [artist.id],
-        firstSeen: now,
-        lastSeen: now,
-        isNew: !firstCheck,
-        delisted: false,
-        priceHistory: [],
-        priceChange: null,
-        statusChange: null,
-        altUrls: {},
-        mine: emptyMine(),
-      };
+      target = newEvent(ev, now);
+      target[key] = [owner.id];
+      const announce = !firstCheck && !(kind === 'place' && owner.kind === 'area');
+      target.isNew = announce;
       st.events[ev.id] = target;
-      if (target.isNew && ev.date && ev.date >= todayStr()) summary.newShows.push(target);
+      if (announce && ev.date && ev.date >= today) summary.newShows.push(target);
+      if (source === 'sg') {
+        target.resale = null;
+        trackResale(target, ev.resale, now);
+      }
     } else {
       const prevStatus = target.status;
+      const before = lowestKnownPrice(target);
       const keep = {
         artistIds: target.artistIds || [],
+        placeIds: target.placeIds || [],
         firstSeen: target.firstSeen,
         isNew: target.isNew,
         priceHistory: target.priceHistory || [],
@@ -146,45 +202,85 @@ function mergeEvents(st, artist, source, incoming, now, firstCheck, summary) {
         altUrls: target.altUrls || {},
         mine: { ...emptyMine(), ...(target.mine || {}) },
         alertedAt: target.alertedAt,
+        resale: target.resale || null,
         image: ev.image || target.image,
       };
       Object.assign(target, ev, keep, { lastSeen: now, delisted: false });
-      if (!target.artistIds.includes(artist.id)) target.artistIds.push(artist.id);
+      if (source === 'sg') trackResale(target, ev.resale, now);
       if (prevStatus && ev.status && prevStatus !== ev.status) {
         target.statusChange = { from: prevStatus, to: ev.status, t: now };
         summary.statusChanges.push(target);
       }
+      trackFace(target, now);
+      noteChange(target, before, now, summary);
     }
+    if (!target[key]) target[key] = [];
+    if (!target[key].includes(owner.id)) target[key].push(owner.id);
+    if (st.events[ev.id] === target && source === 'tm' && target.priceHistory.length === 0) trackFace(target, now);
     seen.add(target.id);
-    trackPrice(target, now, summary);
+    checkTarget(target, now, summary);
+
+    // Fill in the artist's genre/photo from Ticketmaster data (used for suggestions).
+    if (kind === 'artist' && source === 'tm' && owner.tmId) {
+      const me = (ev.attractions || []).find((a) => a.tmId === owner.tmId);
+      if (me) {
+        if (!owner.genreIds?.length && (me.genreId || me.subGenreId)) {
+          owner.genreIds = [me.genreId].filter(Boolean);
+          owner.subGenreIds = [me.subGenreId].filter(Boolean);
+          if (!owner.genre) owner.genre = [me.genre, me.subGenre].filter((g, i, a) => g && a.indexOf(g) === i).join(' · ');
+        }
+        if (!owner.image && me.image) owner.image = me.image;
+      }
+    }
   }
 
-  // Shows from this source that disappeared from the listing (but are still in the future).
-  const today = todayStr();
+  // Shows from this source that disappeared from the listing.
   for (const ev of Object.values(st.events)) {
-    if (ev.source !== source || !ev.artistIds?.includes(artist.id)) continue;
-    if (seen.has(ev.id) || !ev.date || ev.date < today) continue;
-    ev.delisted = true;
+    if (!ev[key]?.includes(owner.id) || seen.has(ev.id) || !ev.date || ev.date < today) continue;
+    if (kind === 'place') {
+      // Area/venue feeds only cover a window; just detach the show.
+      if (ev.source === 'tm' && source === 'tm') ev.placeIds = ev.placeIds.filter((x) => x !== owner.id);
+    } else if (ev.source === source) {
+      ev.delisted = true;
+    }
   }
 }
 
-function trackPrice(ev, now, summary) {
+function trackFace(ev, now) {
   if (ev.priceMin == null && ev.priceMax == null) return;
-  const apiHist = ev.priceHistory.filter((h) => h.src === 'api');
-  const last = apiHist[apiHist.length - 1];
+  const hist = ev.priceHistory.filter((h) => h.src === 'api');
+  const last = hist[hist.length - 1];
   if (!last || last.min !== ev.priceMin || last.max !== ev.priceMax) {
     ev.priceHistory.push({ t: now, min: ev.priceMin, max: ev.priceMax, src: 'api' });
-    if (last && last.min != null && ev.priceMin != null && ev.priceMin !== last.min) {
-      ev.priceChange = { dir: ev.priceMin < last.min ? 'down' : 'up', from: last.min, to: ev.priceMin, t: now };
-      if (ev.priceChange.dir === 'down') summary.priceDrops.push(ev);
-    }
   }
-  checkTarget(ev, now, summary);
 }
 
+function trackResale(ev, resale, now) {
+  if (!resale) {
+    if (ev.resale) ev.resale = { ...ev.resale, count: 0, t: now, gone: true };
+    return;
+  }
+  ev.resale = { ...resale, t: now };
+  ev.priceHistory = ev.priceHistory || [];
+  const hist = ev.priceHistory.filter((h) => h.src === 'resale');
+  const last = hist[hist.length - 1];
+  if (!last || last.min !== resale.min) {
+    ev.priceHistory.push({ t: now, min: resale.min, max: resale.max ?? null, src: 'resale', note: resale.src || 'SeatGeek' });
+  }
+}
+
+function noteChange(ev, before, now, summary) {
+  const after = lowestKnownPrice(ev);
+  if (before == null || after == null || Math.abs(after - before) < 0.5) return;
+  ev.priceChange = { dir: after < before ? 'down' : 'up', from: before, to: after, t: now };
+  if (after < before) summary.priceDrops.push(ev);
+}
+
+/** Lowest price we know of right now: face value, current resale, or the last price you logged. */
 export function lowestKnownPrice(ev) {
   const vals = [];
   if (ev.priceMin != null) vals.push(ev.priceMin);
+  if (ev.resale && !ev.resale.gone && ev.resale.min != null) vals.push(ev.resale.min);
   const manual = (ev.priceHistory || []).filter((h) => h.src === 'manual');
   const lastManual = manual[manual.length - 1];
   if (lastManual?.min != null) vals.push(lastManual.min);
@@ -206,25 +302,31 @@ export function checkTarget(ev, now = Date.now(), summary = null) {
   return false;
 }
 
-// Keep past shows you went to (your concert history); drop other past shows after 30 days.
-function prunePast(st) {
+// Keep past shows you went to (your concert history); drop other past shows.
+export function prune(st) {
+  const today = todayStr();
   const cutoff = todayStr(-30);
   for (const [id, ev] of Object.entries(st.events)) {
-    if (!ev.date || ev.date >= cutoff) continue;
     const m = ev.mine || {};
-    if (m.status === 'going' || m.status === 'tickets' || m.notes) continue;
-    delete st.events[id];
+    const mine = m.status || m.notes || m.files?.length;
+    const orphan = !ev.artistIds?.length && !ev.placeIds?.length;
+    if (mine) continue;
+    if (orphan || (ev.date && ev.date < cutoff) || (!ev.artistIds?.length && ev.date && ev.date < today)) {
+      delete st.events[id];
+    }
   }
 }
 
 async function maybeNotify(summary) {
   const s = getState();
+  // With background alerts on, the server sends pushes; don't double up.
+  if (s.settings.push?.enabled) return;
   if (!s.settings.notify || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
   const lines = [];
-  const name = (ev) => artistNames(ev).join(', ') || ev.name;
+  const name = (ev) => eventName(ev);
   for (const ev of summary.alerts.slice(0, 3)) lines.push(`🎯 ${name(ev)} under your target — ${fmtMoney(lowestKnownPrice(ev), ev.currency)}`);
   for (const ev of summary.newShows.slice(0, 3)) lines.push(`🆕 ${name(ev)} · ${ev.venue?.city || ev.venue?.name || ''} ${ev.date || ''}`);
-  for (const ev of summary.priceDrops.slice(0, 2)) lines.push(`⬇️ ${name(ev)} now from ${fmtMoney(ev.priceMin, ev.currency)}`);
+  for (const ev of summary.priceDrops.slice(0, 2)) lines.push(`⬇️ ${name(ev)} now from ${fmtMoney(lowestKnownPrice(ev), ev.currency)}`);
   for (const ev of summary.statusChanges.slice(0, 2)) lines.push(`⚠️ ${name(ev)}: ${STATUS_LABEL[ev.status] || ev.status}`);
   if (!lines.length) return;
   const title = summary.alerts.length ? 'Price alert' : summary.newShows.length ? `${summary.newShows.length} new show${summary.newShows.length > 1 ? 's' : ''}` : 'Show updates';
@@ -241,4 +343,12 @@ async function maybeNotify(summary) {
 export function artistNames(ev) {
   const s = getState();
   return (ev.artistIds || []).map((id) => s.artists.find((a) => a.id === id)?.name).filter(Boolean);
+}
+
+/** Display name: followed artists first, otherwise the headliners from the lineup. */
+export function eventName(ev) {
+  const names = artistNames(ev);
+  if (names.length) return names.join(' & ');
+  if (ev.lineup?.length) return ev.lineup.slice(0, 2).join(' & ');
+  return ev.name || 'Concert';
 }

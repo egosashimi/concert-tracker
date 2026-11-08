@@ -2,14 +2,17 @@
 
 import { getState, update, exportJSON, importJSON, resetAll, storageBytes } from './store.js';
 import { tmSearchArtists, geocodeCity, currentPosition, reverseLabel } from './api.js';
-import { refresh, isRefreshing, emptyMine, checkTarget, lowestKnownPrice, artistNames } from './refresh.js';
+import { isRefreshing, emptyMine, checkTarget, lowestKnownPrice, artistNames } from './refresh.js';
+import { putFile, allFiles, blobToDataURL, dataURLToBlob } from './files.js';
+import { mountPriceChart, priceInsights, hasChartData } from './chart.js';
+import { walletHtml, wireWallet, syncSettingsHtml, wireSyncSettings, tonightEvents } from './views-more.js';
 import {
   esc, uid, debounce, fmtDate, fmtTime, fmtDateTimeISO, fmtMoney, fmtPriceRange, countdown, timeAgo,
-  placeLine, fmtDistance, todayStr, toDateStr, parseLocalDate, isIOS, isStandalone, shareOrDownload, normalizeName, haptic,
+  placeLine, fmtDistance, todayStr, toDateStr, parseLocalDate, daysUntil, isIOS, isStandalone, shareOrDownload, normalizeName, haptic,
 } from './util.js';
 import {
   icon, toast, openSheet, closeSheet, confirmSheet, showCard, avatar, groupByMonth, sortEvents, eventTitle,
-  eventBadges, eventDistance, priceChart, wireChart, buildICS, statusLabel, isCancelled, onSaleSoon,
+  eventBadges, eventDistance, buildICS, lowSource, statusLabel, isCancelled, onSaleSoon,
 } from './ui.js';
 
 // In-memory UI state (not persisted).
@@ -23,7 +26,7 @@ export const ui = {
   refreshProgress: null, // { done, total, name }
 };
 
-const header = ({ title, sub = '', left = '', right = '', small = false }) => `
+export const header = ({ title, sub = '', left = '', right = '', small = false }) => `
   <header class="header">
     <div class="header-row">
       ${left}
@@ -33,13 +36,13 @@ const header = ({ title, sub = '', left = '', right = '', small = false }) => `
     ${sub ? `<div class="sub">${sub}</div>` : ''}
   </header>`;
 
-const backBtn = () => `<button class="icon-btn ghost" data-action="back" aria-label="Back">${icon('back')}</button>`;
+export const backBtn = () => `<button class="icon-btn ghost" data-action="back" aria-label="Back">${icon('back')}</button>`;
 
-function refreshButton() {
+export function refreshButton() {
   return `<button class="icon-btn ${isRefreshing() ? 'spinning' : ''}" data-action="refresh" aria-label="Refresh shows">${icon('refresh')}</button>`;
 }
 
-function progressBar() {
+export function progressBar() {
   const p = ui.refreshProgress;
   if (!p) return '';
   const pct = p.total ? Math.round((p.done / p.total) * 100) : 5;
@@ -52,12 +55,22 @@ export function upcomingEvents() {
   return Object.values(getState().events).filter((e) => !e.date || e.date >= today);
 }
 
+/** Shows that belong in "my" feed: by followed artists, or ones you've marked. */
+export const isMyShow = (e) => (e.artistIds?.length > 0) || !!e.mine?.status;
+export const myUpcoming = () => upcomingEvents().filter(isMyShow);
+
+/** Stamp "my plans" edits so sync can tell which copy is newer. */
+export function touchMine(e) {
+  e.mine = { ...emptyMine(), ...(e.mine || {}), t: Date.now() };
+  return e.mine;
+}
+
 // =====================================================================
 // Shows
 // =====================================================================
 export function renderShows() {
   const s = getState();
-  const all = upcomingEvents();
+  const all = myUpcoming();
   const home = s.settings.home;
   const radius = s.settings.radius;
   const q = normalizeName(ui.showsQuery);
@@ -88,6 +101,10 @@ export function renderShows() {
     : '';
 
   let banners = '';
+  for (const ev of tonightEvents()) {
+    banners += `<a class="banner tonight" href="#/tonight/${encodeURIComponent(ev.id)}">${icon('moon')}<div class="grow"><b>${ev.date === todayStr() ? 'Tonight' : 'Tomorrow'}: ${esc(eventTitle(ev))}</b>
+      <p>${esc([ev.venue?.name, (ev.mine?.doors || ev.doorsTime) ? `doors ${fmtTime(ev.mine?.doors || ev.doorsTime)}` : '', ev.time ? `show ${fmtTime(ev.time)}` : ''].filter(Boolean).join(' · '))} — open show-day view</p></div>${icon('chev', 'chev')}</a>`;
+  }
   if (isIOS && !isStandalone() && !s.installHintDismissed) {
     banners += `<div class="banner info">${icon('share')}<div class="grow"><b>Install on your Home Screen</b>
       <p>Tap the Share button in Safari, then <b style="display:inline">Add to Home Screen</b>. Your data stays on this phone.</p></div>
@@ -119,7 +136,7 @@ export function renderShows() {
       <div class="shows">${g.events.map((e) => showCard(e)).join('')}</div>`).join('');
   }
 
-  const pastCount = Object.values(s.events).filter((e) => e.date && e.date < todayStr()).length;
+  const pastCount = Object.values(s.events).filter((e) => e.date && e.date < todayStr() && isMyShow(e)).length;
 
   return `
     ${header({
@@ -137,7 +154,7 @@ export function renderShows() {
     ${newCount && ui.showsFilter !== 'hidden' ? `<div class="status-line"><span>${newCount} new since you last looked</span><button class="btn sm" data-action="mark-seen">Mark all seen</button></div>` : ''}
     <div id="shows-list">${body}</div>
     ${pastCount ? `<div class="section-title" style="margin-top:32px"><span>Past shows</span><button class="btn sm" data-action="toggle-past">${ui.showPast ? 'Hide' : `Show ${pastCount}`}</button></div>
-      ${ui.showPast ? `<div class="shows">${sortEvents(Object.values(s.events).filter((e) => e.date && e.date < todayStr())).reverse().map((e) => showCard(e)).join('')}</div>` : ''}` : ''}
+      ${ui.showPast ? `<div class="shows">${sortEvents(Object.values(s.events).filter((e) => e.date && e.date < todayStr() && isMyShow(e))).reverse().map((e) => showCard(e)).join('')}</div>` : ''}` : ''}
   `;
 }
 
@@ -166,7 +183,7 @@ export function renderCalendar() {
   const gridStart = new Date(year, month, 1 - startDow);
   const byDate = {};
   for (const e of Object.values(s.events)) {
-    if (!e.date || e.mine?.hidden) continue;
+    if (!e.date || e.mine?.hidden || !isMyShow(e)) continue;
     (byDate[e.date] ||= []).push(e);
   }
   const today = todayStr();
@@ -181,14 +198,14 @@ export function renderCalendar() {
     if (i >= 34 && d.getMonth() !== month && d.getDay() === 6) break;
   }
   const dows = Array.from({ length: 7 }, (_, i) => new Date(2023, 0, 1 + i).toLocaleDateString(undefined, { weekday: 'narrow' }));
-  const monthEvents = sortEvents(Object.values(s.events).filter((e) => e.date && !e.mine?.hidden && parseLocalDate(e.date).getMonth() === month && parseLocalDate(e.date).getFullYear() === year));
+  const monthEvents = sortEvents(Object.values(s.events).filter((e) => e.date && !e.mine?.hidden && isMyShow(e) && parseLocalDate(e.date).getMonth() === month && parseLocalDate(e.date).getFullYear() === year));
   const listEvents = ui.calSelected ? (byDate[ui.calSelected] || []) : monthEvents;
   const mineUpcoming = sortEvents(upcomingEvents().filter((e) => ['going', 'tickets'].includes(e.mine?.status)));
 
   return `
     ${header({
       title: 'Calendar',
-      right: mineUpcoming.length ? `<button class="icon-btn" data-action="export-mine-ics" aria-label="Add my shows to Calendar">${icon('download')}</button>` : '',
+      right: `<a class="icon-btn" href="#/stats" aria-label="Your concert stats">${icon('chart')}</a>${mineUpcoming.length ? `<button class="icon-btn" data-action="export-mine-ics" aria-label="Add my shows to Calendar">${icon('download')}</button>` : ''}`,
     })}
     <div class="cal-head">
       <button class="icon-btn" data-action="cal-prev" aria-label="Previous month">${icon('back')}</button>
@@ -257,7 +274,7 @@ export function renderArtists() {
     ${header({
       title: 'Artists',
       sub: s.artists.length ? `${s.artists.length} tracked` : '',
-      right: `<button class="icon-btn accent" data-action="add-artist" aria-label="Add artist">${icon('plus')}</button>`,
+      right: `<a class="icon-btn" href="#/import" aria-label="Import artists">${icon('download')}</a><button class="icon-btn accent" data-action="add-artist" aria-label="Add artist">${icon('plus')}</button>`,
     })}
     ${s.artists.length ? `
       <div class="section-title"><span>Following</span><button class="btn sm" data-action="artist-sort">${icon('sort')}${sortLabel}</button></div>
@@ -278,7 +295,10 @@ export function renderArtists() {
         <div class="art">${icon('music')}</div>
         <h2>Follow your first artist</h2>
         <p>${getState().settings.tmKey ? 'Search Ticketmaster to add an artist and pull in their tour dates.' : 'Add artists by name. Connect Ticketmaster in Settings to find their shows automatically.'}</p>
-        <button class="btn primary" data-action="add-artist">${icon('plus')}Add an artist</button>
+        <div class="stack" style="max-width:280px;margin:0 auto">
+          <button class="btn primary block" data-action="add-artist">${icon('plus')}Add an artist</button>
+          <a class="btn block" href="#/import">Import from Spotify, Apple Music or a list</a>
+        </div>
       </div>`}
   `;
 }
@@ -291,10 +311,7 @@ export function openAddArtist() {
       <div class="search">${icon('search')}<input id="artist-q" class="input" type="search" placeholder="${hasKey ? 'Search Ticketmaster…' : 'Artist name'}" autocomplete="off" autocapitalize="words" enterkeyhint="search"></div>
       ${hasKey ? '' : '<p class="help">No Ticketmaster key yet — artists are added by name. <a href="#/settings" data-close-sheet>Add a key</a> to search and fetch shows.</p>'}
       <div id="artist-results" style="margin-top:12px"></div>
-      <div class="section-title"><span>Add several at once</span></div>
-      <textarea id="artist-bulk" class="input" placeholder="One artist per line" rows="3"></textarea>
-      <button class="btn block" data-bulk style="margin-top:8px">Add list</button>
-      <p class="help">${hasKey ? 'Each name is matched to its best Ticketmaster result.' : 'Names are added as-is.'}</p>`,
+      <a class="row card" href="#/import" style="margin-top:16px">${icon('download', 'chev')}<div class="grow"><div class="title">Import many artists</div><div class="subtitle">From Spotify, Apple Music, or a pasted list</div></div>${icon('chev', 'chev')}</a>`,
     onMount: (body, close) => {
       const input = body.querySelector('#artist-q');
       const results = body.querySelector('#artist-results');
@@ -339,28 +356,6 @@ export function openAddArtist() {
       input.addEventListener('input', search);
       input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
 
-      body.querySelector('[data-bulk]').addEventListener('click', async (e) => {
-        const names = body.querySelector('#artist-bulk').value.split(/\n|,/).map((x) => x.trim()).filter(Boolean);
-        if (!names.length) return;
-        const btn = e.currentTarget;
-        btn.disabled = true;
-        let added = 0;
-        for (const [i, name] of names.entries()) {
-          btn.textContent = `Adding ${i + 1}/${names.length}…`;
-          let match = { name };
-          if (hasKey) {
-            try {
-              const found = await tmSearchArtists(name, getState().settings.tmKey);
-              match = found.find((f) => normalizeName(f.name) === normalizeName(name)) || found[0] || { name };
-            } catch { /* fall back to manual */ }
-            await new Promise((r) => setTimeout(r, 250));
-          }
-          if (addArtist(match, { silentRefresh: true, quiet: true })) added++;
-        }
-        close();
-        toast(`Added ${added} artist${added === 1 ? '' : 's'}`);
-        if (getState().settings.tmKey || getState().settings.bitAppId) window.dispatchEvent(new CustomEvent('encore:refresh'));
-      });
     },
   });
 }
@@ -378,6 +373,8 @@ export function addArtist(r, { silentRefresh = false, quiet = false } = {}) {
     tmId: r.tmId || '',
     image: r.image || '',
     genre: r.genre || '',
+    genreIds: [r.genreId].filter(Boolean),
+    subGenreIds: [r.subGenreId].filter(Boolean),
     url: r.url || '',
     addedAt: Date.now(),
     lastChecked: 0,
@@ -511,6 +508,7 @@ export async function removeArtist(id, go) {
   if (!ok) return;
   update((st) => {
     st.artists = st.artists.filter((x) => x.id !== id);
+    st.deleted.artists[id] = Date.now();
     for (const [eid, ev] of Object.entries(st.events)) {
       if (!ev.artistIds?.includes(id)) continue;
       const keep = ev.mine?.status || ev.mine?.notes;
@@ -585,16 +583,20 @@ export function renderEvent(id) {
           <label class="field"><span>Paid each</span><input class="input" type="number" inputmode="decimal" min="0" step="0.01" id="mine-paid" data-mine="paid" value="${m.paid ?? ''}" placeholder="0.00"></label>
         </div>
         <label class="field"><span>Section / row / seats</span><input class="input" id="mine-seats" data-mine="seats" value="${esc(m.seats)}" placeholder="GA floor, Sec 104 Row F…"></label>
+        <label class="field"><span>Doors open${ev.doorsTime ? ` (listed ${esc(fmtTime(ev.doorsTime))})` : ''}</span><input class="input" type="time" id="mine-doors" data-mine="doors" value="${esc((m.doors || '').slice(0, 5))}"></label>
         ${m.qty && m.paid ? `<div class="small muted">Total ${esc(fmtMoney(m.qty * m.paid, ev.currency))}${low != null && m.paid > low ? ` · now listed from ${esc(fmtMoney(low, ev.currency))}` : ''}</div>` : ''}
       </div>` : ''}
+    ${m.status === 'tickets' || m.status === 'going' || m.files?.length ? walletHtml(ev) : ''}
 
     <div class="section-title"><span>Tickets & prices</span></div>
     <div class="card pad">
       ${low != null
         ? `<div class="price-big">${esc(fmtMoney(low, ev.currency))} <small>${ev.priceMax != null && ev.priceMax > low ? `– ${esc(fmtMoney(ev.priceMax, ev.currency))}` : 'lowest'}</small></div>
-           <div class="small muted">${ev.priceMin != null ? 'Face value listed on Ticketmaster' : 'Last price you logged'}${ev.priceChange ? ` · ${ev.priceChange.dir === 'down' ? '▼' : '▲'} ${esc(fmtMoney(Math.abs(ev.priceChange.to - ev.priceChange.from), ev.currency))} ${esc(timeAgo(ev.priceChange.t))}` : ''}</div>`
+           <div class="small muted">${{ face: 'Face value on Ticketmaster', resale: `Resale on ${esc(ev.resale?.src || 'SeatGeek')}`, manual: 'Last price you logged' }[lowSource(ev)]}${ev.priceChange ? ` · ${ev.priceChange.dir === 'down' ? '▼' : '▲'} ${esc(fmtMoney(Math.abs(ev.priceChange.to - ev.priceChange.from), ev.currency))} ${esc(timeAgo(ev.priceChange.t))}` : ''}</div>`
         : `<div class="small muted">${ev.source === 'tm' ? 'Ticketmaster hasn’t published prices for this show. Log prices you see (including resale) to track them here.' : 'No price data yet. Log prices you see to track them.'}</div>`}
-      ${priceChart(ev)}
+      ${ev.resale && !ev.resale.gone && ev.priceMin != null ? `<div class="resale-line"><span><i class="sw s1"></i>Face value from <b>${esc(fmtMoney(ev.priceMin, ev.currency))}</b></span><span><i class="sw s2"></i>Resale from <b>${esc(fmtMoney(ev.resale.min, ev.currency))}</b></span></div>` : ''}
+      ${hasChartData(ev) ? '<div id="price-chart" class="chart"></div>' : ''}
+      ${priceInsights(ev).length ? `<ul class="insights">${priceInsights(ev).map((i) => `<li class="${i.tone}">${esc(i.text)}</li>`).join('')}</ul>` : ''}
       <div class="field-row" style="margin-top:14px">
         <label class="field"><span>Alert me at or under</span><input class="input" type="number" inputmode="decimal" min="0" step="1" id="target-price" data-target value="${m.targetPrice ?? ''}" placeholder="${low != null ? Math.floor(low * 0.85) : 'e.g. 60'}"></label>
         <div class="field"><span>&nbsp;</span><button class="btn block" data-action="log-price">${icon('edit')}Log a price</button></div>
@@ -603,6 +605,7 @@ export function renderEvent(id) {
       <div class="stack" style="margin-top:14px">
         ${ev.url ? `<a class="btn primary block" href="${esc(ev.url)}" target="_blank" rel="noopener">${icon('ticket')}${isCancelled(ev) ? 'View listing' : 'Get tickets'}</a>` : ''}
         ${ev.altUrls?.bit ? `<a class="btn block" href="${esc(ev.altUrls.bit)}" target="_blank" rel="noopener">${icon('ext')}Bandsintown</a>` : ''}
+        ${ev.resale?.url || ev.altUrls?.sg ? `<a class="btn block" href="${esc(ev.resale?.url || ev.altUrls.sg)}" target="_blank" rel="noopener">${icon('ext')}SeatGeek listings${ev.resale?.count ? ` (${ev.resale.count})` : ''}</a>` : ''}
         <div class="btn-grid">
           <a class="btn sm" href="https://www.stubhub.com/secure/search?q=${resaleQ}" target="_blank" rel="noopener">StubHub</a>
           <a class="btn sm" href="https://seatgeek.com/search?search=${resaleQ}" target="_blank" rel="noopener">SeatGeek</a>
@@ -624,7 +627,7 @@ export function renderEvent(id) {
       <div class="list">
         ${history.map((h) => `<div class="row static">
           <div class="grow"><div class="title">${esc(fmtPriceRange(h.min, h.max, ev.currency))}</div>
-          <div class="subtitle">${esc(new Date(h.t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))} · ${h.src === 'manual' ? `You${h.note ? ` — ${esc(h.note)}` : ''}` : 'Ticketmaster'}</div></div>
+          <div class="subtitle">${esc(new Date(h.t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))} · ${h.src === 'manual' ? `You${h.note ? ` — ${esc(h.note)}` : ''}` : h.src === 'resale' ? `Resale (${esc(h.note || 'SeatGeek')})` : 'Ticketmaster face value'}</div></div>
           ${h.src === 'manual' ? `<button class="icon-btn ghost" data-del-price="${h.t}" aria-label="Delete entry">${icon('trash')}</button>` : ''}
         </div>`).join('')}
       </div>` : ''}
@@ -642,12 +645,13 @@ export function renderEvent(id) {
 
     <div class="section-title"><span>More</span></div>
     <div class="list">
+      ${daysUntil(ev.date) != null && daysUntil(ev.date) >= -1 && daysUntil(ev.date) <= 2 ? `<a class="row" href="#/tonight/${encodeURIComponent(ev.id)}"><div class="grow">Show-day view</div>${icon('moon', 'chev')}</a>` : ''}
       <button class="row" data-action="ics"><div class="grow">Add to Calendar</div>${icon('cal', 'chev')}</button>
       <button class="row" data-action="toggle-hide"><div class="grow">${m.hidden ? 'Unhide this show' : 'Hide this show'}</div>${icon(m.hidden ? 'eye' : 'eyeoff', 'chev')}</button>
       ${ev.source === 'manual' ? `<button class="row" data-action="edit-show"><div class="grow">Edit show</div>${icon('edit', 'chev')}</button>
         <button class="row danger" data-action="delete-show"><div class="grow">Delete show</div></button>` : ''}
     </div>
-    <p class="help center" style="margin-top:14px">${ev.source === 'manual' ? 'Added by you' : `From ${ev.source === 'bit' ? 'Bandsintown' : 'Ticketmaster'}`} · first seen ${esc(timeAgo(ev.firstSeen))}${ev.lastSeen ? ` · checked ${esc(timeAgo(ev.lastSeen))}` : ''}</p>
+    <p class="help center" style="margin-top:14px">${ev.source === 'manual' ? 'Added by you' : `From ${{ bit: 'Bandsintown', sg: 'SeatGeek', tm: 'Ticketmaster' }[ev.source] || 'Ticketmaster'}`} · first seen ${esc(timeAgo(ev.firstSeen))}${ev.lastSeen ? ` · checked ${esc(timeAgo(ev.lastSeen))}` : ''}</p>
   `;
 }
 
@@ -657,13 +661,13 @@ export function wireEvent(root, id, rerender, go) {
   // Opening a show clears its "new" flag.
   if (ev.isNew) update((st) => { if (st.events[id]) st.events[id].isNew = false; }, { silent: true });
 
-  wireChart(root);
+  mountPriceChart(root.querySelector('#price-chart'), ev);
+  wireWallet(root, id);
 
   root.querySelectorAll('[data-mystatus]').forEach((b) => b.addEventListener('click', () => {
     haptic();
     update((st) => {
-      const e = st.events[id];
-      e.mine = { ...emptyMine(), ...(e.mine || {}), status: b.dataset.mystatus };
+      touchMine(st.events[id]).status = b.dataset.mystatus;
     });
   }));
 
@@ -671,7 +675,7 @@ export function wireEvent(root, id, rerender, go) {
     const key = input.dataset.mine;
     const save = (silent) => update((st) => {
       const e = st.events[id];
-      e.mine = { ...emptyMine(), ...(e.mine || {}) };
+      touchMine(e);
       if (key === 'qty' || key === 'paid') {
         const n = parseFloat(input.value);
         e.mine[key] = Number.isFinite(n) && n >= 0 ? n : null;
@@ -688,7 +692,7 @@ export function wireEvent(root, id, rerender, go) {
     const n = parseFloat(target.value);
     update((st) => {
       const e = st.events[id];
-      e.mine = { ...emptyMine(), ...(e.mine || {}), targetPrice: Number.isFinite(n) && n > 0 ? n : null };
+      touchMine(e).targetPrice = Number.isFinite(n) && n > 0 ? n : null;
       e.alertedAt = null;
       checkTarget(e);
     });
@@ -766,12 +770,12 @@ export async function exportICS(events, filename) {
 export async function deleteShow(id, go) {
   const ok = await confirmSheet({ title: 'Delete this show?', message: 'This removes the show and your notes for it.', confirm: 'Delete', danger: true });
   if (!ok) return;
-  update((st) => { delete st.events[id]; });
+  update((st) => { delete st.events[id]; st.deleted.events[id] = Date.now(); });
   go('#/shows', true);
 }
 
 // Manual show entry (also used for editing).
-export function openShowForm({ artistId = null, eventId = null } = {}) {
+export function openShowForm({ artistId = null, eventId = null, status = '' } = {}) {
   const s = getState();
   const ev = eventId ? s.events[eventId] : null;
   if (!s.artists.length && !ev) {
@@ -797,6 +801,9 @@ export function openShowForm({ artistId = null, eventId = null } = {}) {
           <label class="field"><span>City</span><input class="input" id="sf-city" value="${esc(v.city || '')}" placeholder="Morrison"></label>
           <label class="field"><span>State / region</span><input class="input" id="sf-region" value="${esc(v.region || '')}" placeholder="CO"></label>
         </div>
+        <label class="field"><span>My plans</span>
+          <select class="input" id="sf-status">${[['', 'None'], ['interested', 'Interested'], ['going', 'Going / went'], ['tickets', 'Got tickets']].map(([k, l]) => `<option value="${k}" ${(ev ? ev.mine?.status || '' : status) === k ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        </label>
         <label class="field"><span>Tour / event name (optional)</span><input class="input" id="sf-name" value="${esc(ev?.name || '')}"></label>
         <label class="field"><span>Ticket link (optional)</span><input class="input" id="sf-url" type="url" inputmode="url" value="${esc(ev?.url || '')}" placeholder="https://"></label>
         ${ev ? '' : `<div class="field-row">
@@ -840,6 +847,8 @@ export function openShowForm({ artistId = null, eventId = null } = {}) {
             venue: { name: g('#sf-venue'), city, region, country: '', address: '', ...coords },
             lastSeen: Date.now(),
           });
+          const newStatus = body.querySelector('#sf-status').value;
+          if ((base.mine?.status || '') !== newStatus) touchMine(base).status = newStatus;
           if (!existing && Number.isFinite(lo)) {
             base.priceHistory.push({ t: Date.now(), min: lo, max: Number.isFinite(hi) && hi >= lo ? hi : null, src: 'manual', note: 'Added with show' });
           }
@@ -894,6 +903,15 @@ export function renderSettings() {
       <p class="help" style="margin:0">Adds tour dates that aren't sold through Ticketmaster (no prices). Bandsintown issues app IDs to artists and partners via their <a href="https://help.artists.bandsintown.com/en/articles/9186477-api-documentation" target="_blank" rel="noopener">API program</a>.</p>
     </div>
 
+    <div class="section-title"><span>SeatGeek resale prices (optional)</span>${st.sgClientId ? '<span class="badge good">On</span>' : ''}</div>
+    <div class="card pad stack">
+      <label class="field"><span>Client ID</span><input class="input" id="set-sg" value="${esc(st.sgClientId)}" placeholder="Your SeatGeek client_id" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <div class="hstack"><button class="btn sm" data-action="save-sg">Save</button>${st.sgClientId ? '<button class="btn sm" data-action="clear-sg">Remove</button>' : ''}</div>
+      <p class="help" style="margin:0">Adds live resale prices (lowest, average, number of listings) to each show and tracks them over time. Register an app at <a href="https://seatgeek.com/account/develop" target="_blank" rel="noopener">seatgeek.com/account/develop</a> to get a client ID.</p>
+    </div>
+
+    ${syncSettingsHtml()}
+
     <div class="section-title"><span>Home location</span></div>
     <div class="card pad stack">
       ${st.home ? `<div class="hstack" style="justify-content:space-between"><div><b>${esc(st.home.label)}</b><div class="small muted">Used for “Near me” and distances</div></div><button class="btn sm" data-action="clear-home">Clear</button></div>` : '<p class="small muted" style="margin:0">Set a home city to see distances and filter shows near you.</p>'}
@@ -922,10 +940,10 @@ export function renderSettings() {
         </select>
       </label>
       <div class="hstack" style="justify-content:space-between">
-        <div><div>Notifications</div><div class="small muted">${notifSupported ? 'Alerts for new shows, price drops and price targets when Encore refreshes' : 'Install Encore to your Home Screen (iOS 16.4+) to enable'}</div></div>
+        <div><div>Notifications</div><div class="small muted">${notifSupported ? 'Alerts when Encore refreshes while open. For alerts while closed, turn on background alerts under Sync.' : 'Install Encore to your Home Screen (iOS 16.4+) to enable'}</div></div>
         <label class="switch"><input type="checkbox" id="set-notify" ${st.notify && notifSupported && Notification.permission === 'granted' ? 'checked' : ''} ${notifSupported ? '' : 'disabled'}><span class="track"></span></label>
       </div>
-      <p class="help" style="margin:0">Encore has no server, so it checks for updates whenever you open it. Last full check: ${esc(timeAgo(s.lastRefresh))}.</p>
+      <p class="help" style="margin:0">Encore checks for updates whenever you open it. Last full check: ${esc(timeAgo(s.lastRefresh))}.</p>
     </div>
 
     <div class="section-title"><span>Appearance</span></div>
@@ -933,7 +951,7 @@ export function renderSettings() {
 
     <div class="section-title"><span>Your data</span><span class="small muted" style="text-transform:none;letter-spacing:0">${kb} KB on this device</span></div>
     <div class="list">
-      <button class="row" data-action="export"><div class="grow"><div class="title">Back up</div><div class="subtitle">Save a file with all artists, shows & notes</div></div>${icon('upload', 'chev')}</button>
+      <button class="row" data-action="export"><div class="grow"><div class="title">Back up</div><div class="subtitle">Save a file with artists, shows, notes & ticket files</div></div>${icon('upload', 'chev')}</button>
       <label class="row" style="cursor:pointer"><div class="grow"><div class="title">Restore from backup</div><div class="subtitle">Replaces what's on this device</div></div>${icon('download', 'chev')}<input type="file" id="import-file" accept="application/json,.json" hidden></label>
       <button class="row" data-action="export-all-ics"><div class="grow"><div class="title">Export my shows to Calendar</div><div class="subtitle">Interested, Going & Got tickets</div></div>${icon('cal', 'chev')}</button>
       <button class="row danger" data-action="reset"><div class="grow">Erase everything</div></button>
@@ -972,6 +990,12 @@ export function wireSettings(root, rerender) {
     set((x) => { x.bitAppId = root.querySelector('#set-bit').value.trim(); });
     toast('Saved');
   });
+  root.querySelector('[data-action="save-sg"]')?.addEventListener('click', () => {
+    set((x) => { x.sgClientId = root.querySelector('#set-sg').value.trim(); });
+    toast('Saved — resale prices load on the next refresh');
+  });
+  root.querySelector('[data-action="clear-sg"]')?.addEventListener('click', () => set((x) => { x.sgClientId = ''; }));
+  wireSyncSettings(root, rerender);
   root.querySelector('#set-country')?.addEventListener('change', (e) => set((x) => { x.countryCode = e.target.value; }));
 
   // City search
@@ -1044,8 +1068,16 @@ export function wireSettings(root, rerender) {
     const ok = await confirmSheet({ title: 'Restore backup?', message: 'This replaces all artists, shows and notes on this device with the backup.', confirm: 'Restore', danger: true });
     if (!ok) { e.target.value = ''; return; }
     try {
-      importJSON(await file.text());
-      toast('Backup restored');
+      const data = JSON.parse(await file.text());
+      importJSON(data);
+      let restored = 0;
+      for (const f of data.files || []) {
+        try {
+          await putFile({ ...f, blob: await dataURLToBlob(f.dataURL), dataURL: undefined });
+          restored++;
+        } catch { /* skip */ }
+      }
+      toast(`Backup restored${restored ? ` with ${restored} ticket file${restored > 1 ? 's' : ''}` : ''}`);
     } catch (err) {
       toast(err.message || 'Could not read that file', { error: true });
     }
@@ -1054,7 +1086,18 @@ export function wireSettings(root, rerender) {
 
 export async function exportBackup() {
   const name = `encore-backup-${todayStr()}.json`;
-  const res = await shareOrDownload(name, exportJSON(), 'application/json');
+  let files = [];
+  try {
+    const all = await allFiles();
+    let total = 0;
+    for (const f of all) {
+      total += f.blob?.size || 0;
+      if (total > 40e6) { toast('Ticket files are large — some were left out of the backup.'); break; }
+      files.push({ id: f.id, eventId: f.eventId, name: f.name, type: f.type, size: f.size, addedAt: f.addedAt, dataURL: await blobToDataURL(f.blob) });
+    }
+  } catch { files = []; }
+  const json = exportJSON({ files });
+  const res = await shareOrDownload(name, json, 'application/json');
   if (res === 'downloaded') toast('Backup saved');
 }
 

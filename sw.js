@@ -2,7 +2,7 @@
 // App files are served from cache and refreshed in the background (stale-while-revalidate).
 // API calls (Ticketmaster, Bandsintown, geocoding) always go to the network.
 
-const VERSION = 'encore-v1';
+const VERSION = 'encore-v2';
 const SHELL = [
   './',
   './index.html',
@@ -15,6 +15,11 @@ const SHELL = [
   './js/ui.js',
   './js/util.js',
   './js/views.js',
+  './js/views-more.js',
+  './js/chart.js',
+  './js/files.js',
+  './js/sync.js',
+  './js/spotify.js',
   './icons/icon.svg',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -69,13 +74,38 @@ self.addEventListener('fetch', (event) => {
   );
 });
 
-// Tapping a notification opens (or focuses) the app.
+// Background alerts sent by the scheduled GitHub Action (see server/check.mjs).
+self.addEventListener('push', (event) => {
+  let d = {};
+  try { d = event.data ? event.data.json() : {}; } catch { d = { body: event.data?.text() || '' }; }
+  const title = d.title || 'Encore';
+  event.waitUntil((async () => {
+    if (typeof d.badge === 'number' && self.navigator?.setAppBadge) {
+      try { await self.navigator.setAppBadge(d.badge); } catch { /* unsupported */ }
+    }
+    await self.registration.showNotification(title, {
+      body: d.body || '',
+      icon: 'icons/icon-192.png',
+      badge: 'icons/icon-192.png',
+      tag: d.tag || 'encore',
+      data: { url: d.url || './#/shows' },
+    });
+  })());
+});
+
+// Tapping a notification opens (or focuses) the app at the right screen.
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
+  const url = new URL(event.notification.data?.url || './#/shows', self.registration.scope).href;
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {
-      for (const c of list) if ('focus' in c) return c.focus();
-      return self.clients.openWindow('./#/shows');
+      for (const c of list) {
+        if ('focus' in c) {
+          c.postMessage({ type: 'open', url });
+          return c.focus();
+        }
+      }
+      return self.clients.openWindow(url);
     }),
   );
 });

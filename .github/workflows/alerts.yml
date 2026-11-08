@@ -1,0 +1,34 @@
+name: Background alerts
+
+# Checks your artists for new shows and price changes and sends push notifications to your phone.
+# Needs two repository secrets (set them up from Encore → Settings → Sync & background alerts):
+#   ENCORE_GIST_ID     the ID of your private Encore sync gist
+#   ENCORE_GIST_TOKEN  a GitHub token with the "gist" scope
+on:
+  schedule:
+    - cron: '23 */2 * * *'   # every 2 hours
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: encore-alerts
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci --prefix server --no-audit --no-fund
+      - run: node server/check.mjs
+        env:
+          ENCORE_GIST_ID: ${{ secrets.ENCORE_GIST_ID }}
+          ENCORE_GIST_TOKEN: ${{ secrets.ENCORE_GIST_TOKEN }}
