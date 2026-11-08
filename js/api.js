@@ -251,6 +251,23 @@ function countryToCode(c) {
   return COUNTRY_CODES[c.toLowerCase()] || c;
 }
 
+// ---------------- MusicBrainz (keyless artist search) ----------------
+// Open music encyclopedia; no key, browser-friendly. Used to look up artist names when no
+// Ticketmaster key is set. Rate limit is ~1 request/second, so callers debounce.
+export async function mbSearchArtists(query) {
+  const url = `https://musicbrainz.org/ws/2/artist?query=${encodeURIComponent(query)}&fmt=json&limit=10`;
+  const data = await getJSON(url);
+  return (data?.artists || [])
+    .filter((a) => (a.score ?? 100) >= 50)
+    .map((a) => ({
+      mbid: a.id,
+      name: a.name,
+      genre: [a.disambiguation, a.type === 'Group' ? 'Band' : a.type === 'Person' ? 'Artist' : a.type, a.area?.name || a.country]
+        .filter(Boolean).filter((x, i, arr) => arr.indexOf(x) === i).slice(0, 3).join(' · '),
+      tags: (a.tags || []).sort((x, y) => (y.count || 0) - (x.count || 0)).slice(0, 2).map((t) => t.name),
+    }));
+}
+
 // ---------------- Geocoding ----------------
 export async function geocodeCity(query) {
   const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(query)}&count=8&language=en&format=json`;

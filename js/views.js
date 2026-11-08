@@ -1,11 +1,11 @@
 // Screens: Shows, Calendar, Artists, Artist detail, Event detail, Settings.
 
 import { getState, update, exportJSON, importJSON, resetAll, storageBytes } from './store.js';
-import { tmSearchArtists, geocodeCity, currentPosition, reverseLabel } from './api.js';
+import { tmSearchArtists, mbSearchArtists, geocodeCity, currentPosition, reverseLabel } from './api.js';
 import { isRefreshing, emptyMine, checkTarget, lowestKnownPrice, artistNames } from './refresh.js';
 import { putFile, allFiles, blobToDataURL, dataURLToBlob } from './files.js';
 import { mountPriceChart, priceInsights, hasChartData } from './chart.js';
-import { walletHtml, wireWallet, syncSettingsHtml, wireSyncSettings, tonightEvents } from './views-more.js';
+import { walletHtml, wireWallet, syncSettingsHtml, wireSyncSettings, tonightEvents, checkLinks } from './views-more.js';
 import {
   esc, uid, debounce, fmtDate, fmtTime, fmtDateTimeISO, fmtMoney, fmtPriceRange, countdown, timeAgo,
   placeLine, fmtDistance, todayStr, toDateStr, parseLocalDate, daysUntil, isIOS, isStandalone, shareOrDownload, normalizeName, haptic,
@@ -24,6 +24,7 @@ export const ui = {
   calMonth: null, // Date of first of month
   calSelected: null,
   refreshProgress: null, // { done, total, name }
+  optionalOpen: false,
 };
 
 export const header = ({ title, sub = '', left = '', right = '', small = false }) => `
@@ -55,6 +56,12 @@ export function upcomingEvents() {
   return Object.values(getState().events).filter((e) => !e.date || e.date >= today);
 }
 
+/** True when an automatic data source (optional API keys) is configured. */
+export function hasSources() {
+  const st = getState().settings;
+  return !!(st.tmKey || st.bitAppId || st.sgClientId);
+}
+
 /** Shows that belong in "my" feed: by followed artists, or ones you've marked. */
 export const isMyShow = (e) => (e.artistIds?.length > 0) || !!e.mine?.status;
 export const myUpcoming = () => upcomingEvents().filter(isMyShow);
@@ -83,9 +90,12 @@ export function renderShows() {
     { id: 'all', label: 'All', test: (e) => !e.mine?.hidden },
     ...(home ? [{ id: 'near', label: 'Near me', test: (e) => !e.mine?.hidden && near(e) }] : []),
     { id: 'mine', label: 'My shows', test: (e) => ['interested', 'going', 'tickets'].includes(e.mine?.status) },
-    { id: 'new', label: 'New', test: (e) => e.isNew && !e.mine?.hidden },
-    { id: 'deals', label: 'Price drops', test: (e) => !e.mine?.hidden && (e.alertedAt || (e.priceChange?.dir === 'down' && Date.now() - e.priceChange.t < 14 * 86400000)) },
-    { id: 'onsale', label: 'On sale soon', test: (e) => !e.mine?.hidden && !!onSaleSoon(e) },
+    // These depend on automatic lookups (optional keys), so they only appear when one is set up.
+    ...(hasSources() ? [
+      { id: 'new', label: 'New', test: (e) => e.isNew && !e.mine?.hidden },
+      { id: 'deals', label: 'Price drops', test: (e) => !e.mine?.hidden && (e.alertedAt || (e.priceChange?.dir === 'down' && Date.now() - e.priceChange.t < 14 * 86400000)) },
+      { id: 'onsale', label: 'On sale soon', test: (e) => !e.mine?.hidden && !!onSaleSoon(e) },
+    ] : []),
     { id: 'hidden', label: 'Hidden', test: (e) => !!e.mine?.hidden },
   ];
   if (!filters.find((f) => f.id === ui.showsFilter)) ui.showsFilter = 'all';
@@ -97,7 +107,7 @@ export function renderShows() {
 
   const newCount = all.filter((e) => e.isNew).length;
   const sub = s.artists.length
-    ? `${all.filter((e) => !e.mine?.hidden).length} upcoming · ${s.artists.length} artist${s.artists.length === 1 ? '' : 's'} · updated ${timeAgo(s.lastRefresh)}`
+    ? `${all.filter((e) => !e.mine?.hidden).length} upcoming · ${s.artists.length} artist${s.artists.length === 1 ? '' : 's'}${hasSources() ? ` · updated ${timeAgo(s.lastRefresh)}` : ''}`
     : '';
 
   let banners = '';
@@ -110,13 +120,24 @@ export function renderShows() {
       <p>Tap the Share button in Safari, then <b style="display:inline">Add to Home Screen</b>. Your data stays on this phone.</p></div>
       <button class="x" data-action="dismiss-install" aria-label="Dismiss">${icon('close')}</button></div>`;
   }
-  if (!s.settings.tmKey && !s.settings.bitAppId && s.artists.length) {
-    banners += `<a class="banner" href="#/settings">${icon('key')}<div class="grow"><b>Turn on automatic show lookup</b>
-      <p>Add a free Ticketmaster API key in Settings to fetch tour dates and prices. You can still add shows by hand.</p></div></a>`;
+  const stale = !hasSources() ? s.artists.filter((a) => Date.now() - Math.max(a.checkedAt || 0, a.lastChecked || 0) > 7 * 86400000).length : 0;
+  if (stale && all.length) {
+    banners += `<a class="banner info" href="#/check">${icon('search')}<div class="grow"><b>Check for new dates</b>
+      <p>${stale} artist${stale === 1 ? '' : 's'} not checked this week — one tap each.</p></div>${icon('chev', 'chev')}</a>`;
   }
 
   let body;
-  if (!s.artists.length && !all.length) {
+  if (s.artists.length && !all.length && ui.showsFilter === 'all' && !ui.showsQuery && !hasSources()) {
+    body = `<div class="empty">
+      <div class="art">${icon('search')}</div>
+      <h2>Any shows coming up?</h2>
+      <p>Check your artists’ tour dates in one tap each, then save the shows you care about to track them here.</p>
+      <div class="stack" style="max-width:280px;margin:0 auto">
+        <a class="btn primary block" href="#/check">${icon('search')}Check for shows</a>
+        <button class="btn block" data-action="add-show">${icon('plus')}Save a show</button>
+      </div>
+    </div>`;
+  } else if (!s.artists.length && !all.length) {
     body = `<div class="empty">
       <div class="art">${icon('music')}</div>
       <h2>No artists yet</h2>
@@ -142,7 +163,7 @@ export function renderShows() {
     ${header({
       title: 'Shows',
       sub,
-      right: `<button class="icon-btn" data-action="add-show" aria-label="Add a show manually">${icon('plus')}</button>${refreshButton()}`,
+      right: `${s.artists.length ? `<a class="icon-btn" href="#/check" aria-label="Check for shows">${icon('search')}</a>` : ''}<button class="icon-btn" data-action="add-show" aria-label="Save a show">${icon('plus')}</button>${hasSources() ? refreshButton() : ''}`,
     })}
     ${progressBar()}
     ${banners}
@@ -294,7 +315,7 @@ export function renderArtists() {
       <div class="empty">
         <div class="art">${icon('music')}</div>
         <h2>Follow your first artist</h2>
-        <p>${getState().settings.tmKey ? 'Search Ticketmaster to add an artist and pull in their tour dates.' : 'Add artists by name. Connect Ticketmaster in Settings to find their shows automatically.'}</p>
+        <p>Add the artists you love, then check their tour dates in one tap.</p>
         <div class="stack" style="max-width:280px;margin:0 auto">
           <button class="btn primary block" data-action="add-artist">${icon('plus')}Add an artist</button>
           <a class="btn block" href="#/import">Import from Spotify, Apple Music or a list</a>
@@ -304,58 +325,88 @@ export function renderArtists() {
 }
 
 export function openAddArtist() {
-  const hasKey = !!getState().settings.tmKey;
+  const tmKey = getState().settings.tmKey;
   openSheet({
     title: 'Add artist',
     body: `
-      <div class="search">${icon('search')}<input id="artist-q" class="input" type="search" placeholder="${hasKey ? 'Search Ticketmaster…' : 'Artist name'}" autocomplete="off" autocapitalize="words" enterkeyhint="search"></div>
-      ${hasKey ? '' : '<p class="help">No Ticketmaster key yet — artists are added by name. <a href="#/settings" data-close-sheet>Add a key</a> to search and fetch shows.</p>'}
+      <div class="search">${icon('search')}<input id="artist-q" class="input" type="search" placeholder="Artist or band name" autocomplete="off" autocapitalize="words" enterkeyhint="done"></div>
       <div id="artist-results" style="margin-top:12px"></div>
       <a class="row card" href="#/import" style="margin-top:16px">${icon('download', 'chev')}<div class="grow"><div class="title">Import many artists</div><div class="subtitle">From Spotify, Apple Music, or a pasted list</div></div>${icon('chev', 'chev')}</a>`,
     onMount: (body, close) => {
       const input = body.querySelector('#artist-q');
       const results = body.querySelector('#artist-results');
-      body.querySelector('[data-close-sheet]')?.addEventListener('click', () => close());
       setTimeout(() => input.focus(), 320);
       let seq = 0;
-      const renderManual = (q) => (q ? `<button class="row" data-manual="${esc(q)}">
-          <div class="avatar">${icon('plus')}</div>
-          <div class="grow"><div class="title">Add “${esc(q)}”</div><div class="subtitle">${hasKey ? 'Without Ticketmaster — add shows yourself' : 'Track this artist'}</div></div></button>` : '');
-      const search = debounce(async () => {
+      let found = [];
+      let lookupNote = '';
+
+      const followedNames = () => new Set(getState().artists.map((a) => normalizeName(a.name)));
+      const draw = (q, { loading = false } = {}) => {
+        if (!q) { results.innerHTML = ''; return; }
+        const following = followedNames();
+        const exact = found.find((r) => normalizeName(r.name) === normalizeName(q));
+        const others = found.filter((r) => r !== exact && !following.has(normalizeName(r.name))).slice(0, 8);
+        const top = exact || { name: q };
+        const isFollowing = following.has(normalizeName(top.name));
+        results.innerHTML = `<div class="list">
+            <button class="row" data-pick="top" ${isFollowing ? 'disabled' : ''}>
+              ${exact ? avatar(exact) : `<div class="avatar">${icon('plus')}</div>`}
+              <div class="grow"><div class="title">${isFollowing ? '' : 'Add '}${esc(top.name)}</div>
+              <div class="subtitle">${isFollowing ? 'Already following' : esc(exact?.genre || 'Tap to follow')}</div></div>
+              <span class="badge ${isFollowing ? 'good' : 'accent'} add-pill">${isFollowing ? 'Following' : 'Add'}</span>
+            </button>
+          </div>
+          ${others.length ? `<div class="section-title" style="margin-top:14px"><span>Did you mean</span></div>
+            <div class="list">${others.map((r) => `<button class="row" data-pick="${found.indexOf(r)}">
+              ${avatar(r)}
+              <div class="grow"><div class="title">${esc(r.name)}</div><div class="subtitle">${esc([r.genre, r.upcoming ? `${r.upcoming} upcoming` : ''].filter(Boolean).join(' · '))}</div></div>
+              <span class="badge accent add-pill">Add</span></button>`).join('')}</div>` : ''}
+          ${loading ? '<div class="loading-row"><span class="spinner"></span></div>' : ''}
+          ${lookupNote ? `<p class="help">${esc(lookupNote)}</p>` : ''}`;
+      };
+
+      // One delegated handler, so every row is always tappable.
+      results.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-pick]');
+        if (!btn || btn.disabled) return;
+        const q = input.value.trim();
+        const pick = btn.dataset.pick === 'top'
+          ? (found.find((r) => normalizeName(r.name) === normalizeName(q)) || { name: q })
+          : found[+btn.dataset.pick];
+        if (pick && addArtist(pick)) close();
+      });
+
+      const lookup = debounce(async () => {
         const q = input.value.trim();
         const my = ++seq;
-        if (!q) { results.innerHTML = ''; return; }
-        if (!hasKey) { results.innerHTML = `<div class="list">${renderManual(q)}</div>`; return; }
-        results.innerHTML = '<div class="loading-row"><span class="spinner"></span></div>';
+        if (!q) return;
         try {
-          const found = await tmSearchArtists(q, getState().settings.tmKey);
+          const r = tmKey ? await tmSearchArtists(q, tmKey) : await mbSearchArtists(q);
           if (my !== seq) return;
-          const tracked = new Set(getState().artists.map((a) => a.tmId).filter(Boolean));
-          results.innerHTML = `<div class="list">
-            ${found.map((r, i) => `<button class="row result-row" data-i="${i}" ${tracked.has(r.tmId) ? 'disabled' : ''}>
-              ${avatar(r)}
-              <div class="grow"><div class="title">${esc(r.name)}</div>
-              <div class="subtitle">${[r.genre, r.upcoming ? `${r.upcoming} upcoming` : 'No upcoming events'].filter(Boolean).map(esc).join(' · ')}</div></div>
-              <span class="badge ${tracked.has(r.tmId) ? 'good' : 'accent'} add-pill">${tracked.has(r.tmId) ? 'Following' : 'Add'}</span>
-            </button>`).join('')}
-            ${renderManual(q)}
-          </div>`;
-          results.querySelectorAll('[data-i]').forEach((b) => b.addEventListener('click', () => {
-            addArtist(found[+b.dataset.i]);
-            close();
-          }));
-        } catch (e) {
+          found = r;
+          lookupNote = '';
+        } catch {
           if (my !== seq) return;
-          results.innerHTML = `<p class="help" style="color:var(--bad)">${esc(e.message)}</p><div class="list">${renderManual(q)}</div>`;
+          found = [];
+          lookupNote = navigator.onLine === false ? 'Offline — you can still add the name as typed.' : '';
         }
-        results.querySelector('[data-manual]')?.addEventListener('click', (ev) => {
-          addArtist({ name: ev.currentTarget.dataset.manual });
-          close();
-        });
-      }, 350);
-      input.addEventListener('input', search);
-      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
+        draw(q);
+      }, 450);
 
+      input.addEventListener('input', () => {
+        const q = input.value.trim();
+        found = found.filter((r) => normalizeName(r.name).includes(normalizeName(q)));
+        draw(q, { loading: !!q });
+        if (q.length >= 2) lookup();
+      });
+      input.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        const q = input.value.trim();
+        if (!q) return;
+        const pick = found.find((r) => normalizeName(r.name) === normalizeName(q)) || { name: q };
+        if (addArtist(pick)) close();
+      });
     },
   });
 }
@@ -376,6 +427,7 @@ export function addArtist(r, { silentRefresh = false, quiet = false } = {}) {
     genreIds: [r.genreId].filter(Boolean),
     subGenreIds: [r.subGenreId].filter(Boolean),
     url: r.url || '',
+    mbid: r.mbid || '',
     addedAt: Date.now(),
     lastChecked: 0,
     lastError: '',
@@ -399,10 +451,7 @@ export function renderArtist(id) {
   const visible = evs.filter((e) => !e.mine?.hidden);
   const hiddenCount = evs.length - visible.length;
   const q = encodeURIComponent(a.name);
-  const links = [
-    a.url || a.tmId ? ['Ticketmaster', a.url || `https://www.ticketmaster.com/search?q=${q}`] : ['Ticketmaster', `https://www.ticketmaster.com/search?q=${q}`],
-    ['Bandsintown', `https://www.bandsintown.com/search?search_term=${q}`],
-    ['Songkick', `https://www.songkick.com/search?query=${q}&type=artists`],
+  const more = [
     ['SeatGeek', `https://seatgeek.com/search?search=${q}`],
     ['StubHub', `https://www.stubhub.com/secure/search?q=${q}`],
     ['Spotify', `https://open.spotify.com/search/${q}`],
@@ -413,16 +462,20 @@ export function renderArtist(id) {
     <div class="center" style="margin-top:16px">
       <div style="display:flex;justify-content:center">${avatar(a, 'lg')}</div>
       <h2 style="margin:12px 0 2px;font-size:26px;letter-spacing:-0.02em">${esc(a.name)}</h2>
-      <div class="muted small">${[a.genre, a.tmId ? 'Ticketmaster' : 'Added by name', a.lastChecked ? `checked ${timeAgo(a.lastChecked)}` : ''].filter(Boolean).map(esc).join(' · ')}</div>
+      <div class="muted small">${esc(a.genre || '')}</div>
       ${a.lastError ? `<div class="small" style="color:var(--bad);margin-top:4px">${esc(a.lastError)}</div>` : ''}
     </div>
-    <div class="section-title"><span>Upcoming (${visible.length})</span><button class="btn sm" data-action="add-show" data-artist="${esc(a.id)}">${icon('plus')}Add show</button></div>
+    <div class="card pad stack" style="margin-top:16px">
+      <div class="hstack" style="justify-content:space-between"><b>Check for shows</b><span class="small muted">${esc(a.checkedAt || a.lastChecked ? `checked ${timeAgo(Math.max(a.checkedAt || 0, a.lastChecked || 0))}` : 'not checked yet')}</span></div>
+      <div class="check-actions">${checkLinks(a).map((l) => `<a class="btn sm ${l.primary ? 'primary' : ''}" href="${esc(l.url)}" target="_blank" rel="noopener" data-check-link data-artist-id="${esc(a.id)}">${esc(l.label)}</a>`).join('')}</div>
+    </div>
+    <div class="section-title"><span>Saved shows (${visible.length})</span><button class="btn sm" data-action="add-show" data-artist="${esc(a.id)}">${icon('plus')}Save a show</button></div>
     ${visible.length ? `<div class="shows">${visible.map((e) => showCard(e, { showArtist: false })).join('')}</div>`
-      : `<div class="card pad muted small">${a.tmId || s.settings.bitAppId ? 'No upcoming shows found. Encore will keep checking.' : 'No shows yet. Add one by hand, or link this artist to Ticketmaster below.'}</div>`}
+      : `<div class="card pad muted small">${a.tmId && s.settings.tmKey ? 'No upcoming shows found automatically. Encore will keep checking.' : 'No shows saved yet. Check above, then tap “Save a show” for any you want to track.'}</div>`}
     ${hiddenCount ? `<p class="help">${hiddenCount} hidden show${hiddenCount > 1 ? 's' : ''} — see the Hidden filter on Shows.</p>` : ''}
-    <div class="section-title"><span>Find tickets & tour dates</span></div>
+    <div class="section-title"><span>More links</span></div>
     <div class="list">
-      ${links.map(([label, url]) => `<a class="row" href="${esc(url)}" target="_blank" rel="noopener"><div class="grow">${esc(label)}</div>${icon('ext', 'chev')}</a>`).join('')}
+      ${more.map(([label, url]) => `<a class="row" href="${esc(url)}" target="_blank" rel="noopener"><div class="grow">${esc(label)}</div>${icon('ext', 'chev')}</a>`).join('')}
     </div>
     <div class="section-title"><span>Manage</span></div>
     <div class="list">
@@ -873,7 +926,42 @@ export function renderSettings() {
   return `
     ${header({ title: 'Settings' })}
 
-    <div class="section-title"><span>Ticketmaster</span>${st.tmKey ? '<span class="badge good">Connected</span>' : ''}</div>
+    <div class="section-title"><span>Home location</span></div>
+    <div class="card pad stack">
+      ${st.home ? `<div class="hstack" style="justify-content:space-between"><div><b>${esc(st.home.label)}</b><div class="small muted">Used for “Near me” and distances</div></div><button class="btn sm" data-action="clear-home">Clear</button></div>` : '<p class="small muted" style="margin:0">Set a home city to see distances and filter shows near you.</p>'}
+      <div class="search">${icon('search')}<input class="input" id="set-city" type="search" placeholder="Search a city" autocomplete="off"></div>
+      <div id="city-results"></div>
+      <button class="btn sm" data-action="use-location" style="align-self:flex-start">${icon('pin')}Use my current location</button>
+      <label class="field"><span>“Near me” radius: <b id="radius-val">${st.radius} ${st.units}</b></span>
+        <input type="range" class="range" id="set-radius" min="10" max="500" step="10" value="${st.radius}">
+      </label>
+      <div class="hstack" style="justify-content:space-between">
+        <span>Units</span>
+        <div class="segmented" style="width:140px">${['mi', 'km'].map((u) => `<button class="${st.units === u ? 'active' : ''}" data-units="${u}">${u}</button>`).join('')}</div>
+      </div>
+      <div class="hstack" style="justify-content:space-between">
+        <div><div>Hide far-away shows</div><div class="small muted">In the “All” list, only show shows inside your radius</div></div>
+        <label class="switch"><input type="checkbox" id="set-hidefar" ${st.hideFarAway ? 'checked' : ''} ${st.home ? '' : 'disabled'}><span class="track"></span></label>
+      </div>
+    </div>
+
+    <div class="section-title"><span>Appearance</span></div>
+    <div class="segmented">${[['auto', 'Automatic'], ['light', 'Light'], ['dark', 'Dark']].map(([k, l]) => `<button class="${st.theme === k ? 'active' : ''}" data-theme-set="${k}">${l}</button>`).join('')}</div>
+
+    <div class="section-title"><span>Your data</span><span class="small muted" style="text-transform:none;letter-spacing:0">${kb} KB on this device</span></div>
+    <div class="list">
+      <button class="row" data-action="export"><div class="grow"><div class="title">Back up</div><div class="subtitle">Save a file with artists, shows, notes & ticket files</div></div>${icon('upload', 'chev')}</button>
+      <label class="row" style="cursor:pointer"><div class="grow"><div class="title">Restore from backup</div><div class="subtitle">Replaces what's on this device</div></div>${icon('download', 'chev')}<input type="file" id="import-file" accept="application/json,.json" hidden></label>
+      <button class="row" data-action="export-all-ics"><div class="grow"><div class="title">Export my shows to Calendar</div><div class="subtitle">Interested, Going & Got tickets</div></div>${icon('cal', 'chev')}</button>
+      <button class="row danger" data-action="reset"><div class="grow">Erase everything</div></button>
+    </div>
+
+    ${syncSettingsHtml()}
+
+    <div class="section-title"><span>Optional extras</span></div>
+    <details class="card pad optional"${hasSources() || ui.optionalOpen ? ' open' : ''}>
+      <summary><b>Automatic show lookup & prices</b><div class="small muted">Not needed — Encore works fully without this. For people who want shows and prices fetched for them.</div></summary>
+    <div class="section-title sub"><span>Ticketmaster</span>${st.tmKey ? '<span class="badge good">Connected</span>' : ''}</div>
     <div class="card pad stack">
       <label class="field"><span>API key (Consumer Key)</span>
         <input class="input" id="set-tm" value="${esc(st.tmKey)}" placeholder="Paste your key" autocomplete="off" autocapitalize="off" spellcheck="false">
@@ -896,42 +984,21 @@ export function renderSettings() {
       </label>
     </div>
 
-    <div class="section-title"><span>Bandsintown (optional)</span>${st.bitAppId ? '<span class="badge good">On</span>' : ''}</div>
+    <div class="section-title sub"><span>Bandsintown (optional)</span>${st.bitAppId ? '<span class="badge good">On</span>' : ''}</div>
     <div class="card pad stack">
       <label class="field"><span>App ID</span><input class="input" id="set-bit" value="${esc(st.bitAppId)}" placeholder="Your Bandsintown app_id" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
       <button class="btn sm" data-action="save-bit" style="align-self:flex-start">Save</button>
       <p class="help" style="margin:0">Adds tour dates that aren't sold through Ticketmaster (no prices). Bandsintown issues app IDs to artists and partners via their <a href="https://help.artists.bandsintown.com/en/articles/9186477-api-documentation" target="_blank" rel="noopener">API program</a>.</p>
     </div>
 
-    <div class="section-title"><span>SeatGeek resale prices (optional)</span>${st.sgClientId ? '<span class="badge good">On</span>' : ''}</div>
+    <div class="section-title sub"><span>SeatGeek resale prices (optional)</span>${st.sgClientId ? '<span class="badge good">On</span>' : ''}</div>
     <div class="card pad stack">
       <label class="field"><span>Client ID</span><input class="input" id="set-sg" value="${esc(st.sgClientId)}" placeholder="Your SeatGeek client_id" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
       <div class="hstack"><button class="btn sm" data-action="save-sg">Save</button>${st.sgClientId ? '<button class="btn sm" data-action="clear-sg">Remove</button>' : ''}</div>
       <p class="help" style="margin:0">Adds live resale prices (lowest, average, number of listings) to each show and tracks them over time. Register an app at <a href="https://seatgeek.com/account/develop" target="_blank" rel="noopener">seatgeek.com/account/develop</a> to get a client ID.</p>
     </div>
 
-    ${syncSettingsHtml()}
-
-    <div class="section-title"><span>Home location</span></div>
-    <div class="card pad stack">
-      ${st.home ? `<div class="hstack" style="justify-content:space-between"><div><b>${esc(st.home.label)}</b><div class="small muted">Used for “Near me” and distances</div></div><button class="btn sm" data-action="clear-home">Clear</button></div>` : '<p class="small muted" style="margin:0">Set a home city to see distances and filter shows near you.</p>'}
-      <div class="search">${icon('search')}<input class="input" id="set-city" type="search" placeholder="Search a city" autocomplete="off"></div>
-      <div id="city-results"></div>
-      <button class="btn sm" data-action="use-location" style="align-self:flex-start">${icon('pin')}Use my current location</button>
-      <label class="field"><span>“Near me” radius: <b id="radius-val">${st.radius} ${st.units}</b></span>
-        <input type="range" class="range" id="set-radius" min="10" max="500" step="10" value="${st.radius}">
-      </label>
-      <div class="hstack" style="justify-content:space-between">
-        <span>Units</span>
-        <div class="segmented" style="width:140px">${['mi', 'km'].map((u) => `<button class="${st.units === u ? 'active' : ''}" data-units="${u}">${u}</button>`).join('')}</div>
-      </div>
-      <div class="hstack" style="justify-content:space-between">
-        <div><div>Hide far-away shows</div><div class="small muted">In the “All” list, only show shows inside your radius</div></div>
-        <label class="switch"><input type="checkbox" id="set-hidefar" ${st.hideFarAway ? 'checked' : ''} ${st.home ? '' : 'disabled'}><span class="track"></span></label>
-      </div>
-    </div>
-
-    <div class="section-title"><span>Updates</span></div>
+    <div class="section-title sub"><span>Updates</span></div>
     <div class="card pad stack">
       <label class="field"><span>Check for new shows & prices when opened, if older than</span>
         <select class="input" id="set-auto">
@@ -946,20 +1013,11 @@ export function renderSettings() {
       <p class="help" style="margin:0">Encore checks for updates whenever you open it. Last full check: ${esc(timeAgo(s.lastRefresh))}.</p>
     </div>
 
-    <div class="section-title"><span>Appearance</span></div>
-    <div class="segmented">${[['auto', 'Automatic'], ['light', 'Light'], ['dark', 'Dark']].map(([k, l]) => `<button class="${st.theme === k ? 'active' : ''}" data-theme-set="${k}">${l}</button>`).join('')}</div>
-
-    <div class="section-title"><span>Your data</span><span class="small muted" style="text-transform:none;letter-spacing:0">${kb} KB on this device</span></div>
-    <div class="list">
-      <button class="row" data-action="export"><div class="grow"><div class="title">Back up</div><div class="subtitle">Save a file with artists, shows, notes & ticket files</div></div>${icon('upload', 'chev')}</button>
-      <label class="row" style="cursor:pointer"><div class="grow"><div class="title">Restore from backup</div><div class="subtitle">Replaces what's on this device</div></div>${icon('download', 'chev')}<input type="file" id="import-file" accept="application/json,.json" hidden></label>
-      <button class="row" data-action="export-all-ics"><div class="grow"><div class="title">Export my shows to Calendar</div><div class="subtitle">Interested, Going & Got tickets</div></div>${icon('cal', 'chev')}</button>
-      <button class="row danger" data-action="reset"><div class="grow">Erase everything</div></button>
-    </div>
+    </details>
 
     <div class="section-title"><span>About</span></div>
     <div class="card pad small muted stack">
-      <p style="margin:0"><b style="color:var(--text)">Encore</b> keeps everything on this phone — no account, no tracking. Show data comes from the Ticketmaster Discovery API and, optionally, Bandsintown. Ticketmaster prices are face-value ranges and may not include fees or resale.</p>
+      <p style="margin:0"><b style="color:var(--text)">Encore</b> keeps everything on this phone — no account, no tracking. Artist search uses MusicBrainz, the open music encyclopedia. “Check for shows” opens Google, Bandsintown, Songkick or Ticketmaster so you can see tour dates without any setup. Optional API keys add automatic lookups and prices.</p>
       ${isIOS && !isStandalone() ? '<p style="margin:0">To install: tap <b>Share</b> → <b>Add to Home Screen</b>. Installed apps keep their data and can send notifications.</p>' : ''}
     </div>
   `;
@@ -967,6 +1025,8 @@ export function renderSettings() {
 
 export function wireSettings(root, rerender) {
   const set = (fn, opts) => update((st) => fn(st.settings), opts);
+  const opt = root.querySelector('details.optional');
+  opt?.addEventListener('toggle', () => { ui.optionalOpen = opt.open; });
 
   root.querySelector('[data-action="save-tm"]')?.addEventListener('click', async (e) => {
     const key = root.querySelector('#set-tm').value.trim();

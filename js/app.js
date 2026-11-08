@@ -70,6 +70,10 @@ function render({ scrollTop = false } = {}) {
       html = M.renderImport();
       wire = () => M.wireImport(app, rerender);
       break;
+    case 'check':
+      html = M.renderCheck();
+      wire = () => M.wireCheck(app);
+      break;
     case 'stats':
       html = M.renderStats();
       wire = () => M.wireStats(app, rerender);
@@ -97,8 +101,11 @@ function render({ scrollTop = false } = {}) {
   app.innerHTML = html;
   wire();
 
-  const tab = { artist: 'artists', event: 'shows', import: 'artists', place: 'discover', stats: 'calendar', tonight: 'shows' }[route.name] || route.name;
+  const tab = { artist: 'artists', event: 'shows', import: 'artists', place: 'discover', stats: 'calendar', tonight: 'shows', check: 'shows' }[route.name] || route.name;
   $$('.tabbar .tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === tab));
+  // Discover is built on Ticketmaster data, so it only appears when that optional key is set.
+  const disc = $('.tabbar [data-tab="discover"]');
+  if (disc) disc.hidden = !getState().settings.tmKey && route.name !== 'discover';
   updateBadge();
 
   if (focusId) {
@@ -148,6 +155,8 @@ subscribe((st) => {
 
 // ---------------- Global click actions ----------------
 document.addEventListener('click', async (e) => {
+  const link = e.target.closest('[data-check-link][data-artist-id]');
+  if (link) M.markChecked(link.dataset.artistId);
   const el = e.target.closest('[data-action]');
   if (!el) return;
   const action = el.dataset.action;
@@ -155,7 +164,7 @@ document.addEventListener('click', async (e) => {
   switch (action) {
     case 'back':
       if (navDepth > 0 && history.length > 1) history.back();
-      else go({ event: '#/shows', tonight: '#/shows', place: '#/discover', stats: '#/calendar' }[route.name] || '#/artists', true);
+      else go({ event: '#/shows', tonight: '#/shows', check: '#/shows', place: '#/discover', stats: '#/calendar' }[route.name] || '#/artists', true);
       break;
     case 'refresh':
       doRefresh({ artistId: route.name === 'artist' ? route.id : null, placeId: route.name === 'place' ? route.id : null, manual: true });
@@ -254,8 +263,8 @@ document.addEventListener('click', async (e) => {
 // ---------------- Refresh ----------------
 async function doRefresh({ artistId = null, placeId = null, manual = false } = {}) {
   const s = getState();
-  if (!s.settings.tmKey && !s.settings.bitAppId && !s.settings.sgClientId) {
-    if (manual) toast('Add a Ticketmaster API key in Settings to fetch shows.', { ms: 3500 });
+  if (!V.hasSources()) {
+    if (manual) go('#/check');
     return;
   }
   if (!s.artists.length && !s.places?.length) {
@@ -331,7 +340,7 @@ window.addEventListener('online', () => autoRefreshIfStale());
   const threshold = 70;
   const routeOk = () => ['shows', 'artist', 'artists', 'calendar', 'discover', 'place'].includes(parseRoute().name);
   window.addEventListener('touchstart', (e) => {
-    if (window.scrollY > 0 || sheetIsOpen() || !routeOk() || isRefreshing()) { startY = null; return; }
+    if (window.scrollY > 0 || sheetIsOpen() || !routeOk() || isRefreshing() || !V.hasSources()) { startY = null; return; }
     startY = e.touches[0].clientY;
     dy = 0;
   }, { passive: true });
@@ -377,6 +386,14 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', applyThe
 // ---------------- Service worker ----------------
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   window.addEventListener('load', async () => {
+    // When an update takes over, reload once so the fixed code runs right away.
+    const hadController = !!navigator.serviceWorker.controller;
+    let reloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController || reloaded || sheetIsOpen()) return;
+      reloaded = true;
+      location.reload();
+    });
     try {
       const reg = await navigator.serviceWorker.register('sw.js', { scope: './' });
       reg.addEventListener('updatefound', () => {

@@ -969,7 +969,7 @@ export function syncSettingsHtml() {
     <div class="section-title"><span>Sync & background alerts</span>${on ? '<span class="badge good">On</span>' : ''}</div>
     <div class="card pad stack">
       ${!on ? `
-        <p class="small muted" style="margin:0">Optional. Keeps a private copy of your data in a secret GitHub Gist so you can restore it on a new phone — and lets a scheduled GitHub Action check for new shows and price drops and <b>notify you even when Encore is closed</b>.</p>
+        <p class="small muted" style="margin:0">Optional. Keeps a private copy of your data in a secret GitHub Gist so you can restore it on a new phone — and lets a scheduled GitHub Action <b>notify you even when Encore is closed</b>: show-day reminders, plus new shows and price drops if you add the optional lookup keys.</p>
         <ol class="steps">
           <li><a href="https://github.com/settings/tokens/new?scopes=gist&description=Encore%20sync" target="_blank" rel="noopener">Create a GitHub token</a> with only the <b>gist</b> box ticked. Set expiration to “No expiration” (or remember to renew it).</li>
           <li>Paste it here and tap Connect. On a second device, use the same token — Encore finds your existing gist.</li>
@@ -1054,3 +1054,74 @@ export function wireSyncSettings(root, rerender) {
 }
 
 export { openShowForm };
+
+// =====================================================================
+// Check for shows — the no-setup way to see if your artists are touring.
+// One tap opens a lookup; anything you find can be saved in a few taps.
+// =====================================================================
+export function checkLinks(artist) {
+  const s = getState();
+  const city = s.settings.home?.label?.split(',')[0] || '';
+  const q = encodeURIComponent(artist.name);
+  return [
+    { id: 'google', label: 'Google', primary: true, url: `https://www.google.com/search?q=${encodeURIComponent(`${artist.name} tour dates${city ? ` ${city}` : ''}`)}` },
+    { id: 'bit', label: 'Bandsintown', url: `https://www.bandsintown.com/search?search_term=${q}` },
+    { id: 'sk', label: 'Songkick', url: `https://www.songkick.com/search?query=${q}&type=artists` },
+    { id: 'tm', label: 'Ticketmaster', url: artist.url || `https://www.ticketmaster.com/search?q=${q}` },
+  ];
+}
+
+export function markChecked(artistId) {
+  update((st) => {
+    const a = st.artists.find((x) => x.id === artistId);
+    if (a) a.checkedAt = Date.now();
+  }, { silent: true });
+}
+
+const checkedLabel = (a) => {
+  const t = Math.max(a.checkedAt || 0, a.lastChecked || 0);
+  return t ? `Checked ${timeAgo(t)}` : 'Not checked yet';
+};
+
+export function renderCheck() {
+  const s = getState();
+  const today = todayStr();
+  const artists = [...s.artists].sort((x, y) => Math.max(x.checkedAt || 0, x.lastChecked || 0) - Math.max(y.checkedAt || 0, y.lastChecked || 0) || x.name.localeCompare(y.name));
+  const due = artists.filter((a) => Date.now() - Math.max(a.checkedAt || 0, a.lastChecked || 0) > 7 * 86400000).length;
+  if (!artists.length) {
+    return `${header({ title: 'Check for shows', small: true, left: backBtn() })}
+      <div class="empty"><div class="art">${icon('search')}</div><h2>Add an artist first</h2>
+      <p>Then come back here to look up their tour dates in one tap.</p>
+      <button class="btn primary" data-action="add-artist">${icon('plus')}Add an artist</button></div>`;
+  }
+  return `
+    ${header({ title: 'Check for shows', small: true, left: backBtn() })}
+    <p class="help" style="margin:12px 4px 0">Tap <b>Google</b> to see an artist’s upcoming dates${s.settings.home ? ` (near ${esc(s.settings.home.label.split(',')[0])} first)` : ''}. Found one you like? Tap <b>Save a show</b> to track it here.${due ? ` <b>${due}</b> not checked this week.` : ''}</p>
+    <div class="check-list">
+      ${artists.map((a) => {
+        const saved = Object.values(s.events).filter((e) => e.artistIds?.includes(a.id) && (!e.date || e.date >= today)).length;
+        return `<div class="card check-card" data-artist="${esc(a.id)}">
+          <div class="check-head">
+            ${avatar(a)}
+            <div class="grow">
+              <a class="title" href="#/artist/${encodeURIComponent(a.id)}">${esc(a.name)}</a>
+              <div class="subtitle"><span data-checked>${esc(checkedLabel(a))}</span>${saved ? ` · ${saved} saved show${saved === 1 ? '' : 's'}` : ''}</div>
+            </div>
+          </div>
+          <div class="check-actions">
+            ${checkLinks(a).map((l) => `<a class="btn sm ${l.primary ? 'primary' : ''}" href="${esc(l.url)}" target="_blank" rel="noopener" data-check-link>${esc(l.label)}</a>`).join('')}
+          </div>
+          <button class="btn sm block" data-action="add-show" data-artist="${esc(a.id)}">${icon('plus')}Save a show</button>
+        </div>`;
+      }).join('')}
+    </div>`;
+}
+
+export function wireCheck(root) {
+  root.querySelectorAll('[data-check-link]').forEach((link) => link.addEventListener('click', () => {
+    const card = link.closest('[data-artist]');
+    markChecked(card.dataset.artist);
+    const label = card.querySelector('[data-checked]');
+    if (label) label.textContent = 'Checked just now';
+  }));
+}
