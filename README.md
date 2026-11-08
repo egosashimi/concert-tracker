@@ -3,10 +3,14 @@
 A phone-first web app for following artists and tracking their upcoming concerts and ticket prices.
 Install it on your iPhone from Safari. Everything stays on your phone: no account, no server, no tracking.
 
+**No setup needed.** Add artists by name (search is powered by the open MusicBrainz database). Tap **Check for shows** to see each artist's tour dates in one tap (Google, Bandsintown, Songkick or Ticketmaster), then save the shows you care about to track dates, prices, tickets and plans. Everything under *Optional extras* in Settings is optional.
+
 ## Features
 
-**Following & discovery**
-- **Follow artists**: search Ticketmaster, add them by name, or **import** them from Spotify (artists you follow plus your top artists), Apple Music (through a Shortcut) or a pasted list.
+**Following & checking**
+- **Check for shows**: every artist you follow, sorted by least recently checked, with one-tap lookups. Encore notes when you last checked each one and nudges you weekly.
+
+- **Follow artists**: type a name (MusicBrainz suggestions, no key) or **import** them from Spotify (artists you follow plus your top artists), Apple Music (through a Shortcut) or a pasted list.
 - **Discover tab**: follow **venues** or a whole **area** (a city plus a radius) to see every concert coming up there.
 - **Suggested artists**: acts sharing a bill with artists you follow, plus artists playing near you in your genres. Follow or dismiss them with one tap.
 
@@ -37,11 +41,11 @@ Also: works offline, light and dark themes, pull-to-refresh, a count badge on th
 
 1. Open the GitHub Pages URL (e.g. `https://<your-user>.github.io/concert-tracker/`) in **Safari**.
 2. Tap **Share** → **Add to Home Screen**.
-3. Open Encore from the Home Screen → **Settings** → paste your Ticketmaster key.
+3. Open Encore from the Home Screen and add your first artist. That's it.
 
-## Getting a Ticketmaster API key (free)
+## Optional: automatic lookups with a Ticketmaster key
 
-Automatic show lookup uses the [Ticketmaster Discovery API](https://developer.ticketmaster.com/products-and-docs/apis/discovery-api/v2/):
+Not required. If you want shows, prices, on-sale dates, the Discover tab and suggestions fetched automatically, add a free key under Settings → Optional extras. Automatic show lookup uses the [Ticketmaster Discovery API](https://developer.ticketmaster.com/products-and-docs/apis/discovery-api/v2/):
 
 1. Sign up at <https://developer-acct.ticketmaster.com/user/register>.
 2. Open **My Apps**. A default app is already created.
@@ -49,7 +53,7 @@ Automatic show lookup uses the [Ticketmaster Discovery API](https://developer.ti
 
 The key is stored only in your phone's browser storage and is sent only to Ticketmaster.
 The free tier allows 5,000 calls a day. A refresh uses about one call per artist.
-Without a key, Encore still works as a manual tracker.
+Without a key, everything else in Encore works and the Discover tab is hidden.
 
 Optional: a Bandsintown `app_id` adds tour dates that aren't sold through Ticketmaster. These dates have no prices.
 

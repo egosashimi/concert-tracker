@@ -1,8 +1,8 @@
 // Encore service worker: makes the app work offline.
-// App files are served from cache and refreshed in the background (stale-while-revalidate).
+// App files load from the network when online (cache is the offline fallback).
 // API calls (Ticketmaster, Bandsintown, geocoding) always go to the network.
 
-const VERSION = 'encore-v2';
+const VERSION = 'encore-v3';
 const SHELL = [
   './',
   './index.html',
@@ -60,16 +60,20 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
+  // App files: network first (so fixes arrive on the next open), cache as the offline fallback.
   event.respondWith(
     caches.open(VERSION).then(async (cache) => {
-      const cached = await cache.match(req, { ignoreSearch: true });
-      const network = fetch(req)
-        .then((res) => {
-          if (res.ok) cache.put(req, res.clone());
-          return res;
-        })
-        .catch(() => cached);
-      return cached || network;
+      try {
+        const res = await Promise.race([
+          fetch(req, { cache: 'no-cache' }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 4000)),
+        ]);
+        if (res.ok) cache.put(req, res.clone());
+        return res;
+      } catch {
+        const cached = await cache.match(req, { ignoreSearch: true });
+        return cached || fetch(req);
+      }
     }),
   );
 });

@@ -384,7 +384,7 @@ textarea.input { min-height: 96px; resize: vertical; line-height: 1.4; }
 .datebox.tba .day { font-size: 14px; }
 .show-card.mine-tickets .datebox { background: var(--good-soft); }
 .show-card.mine-going .datebox { background: var(--accent-soft); }
-.show-card .info { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+.show-card > .info { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
 .show-card .artist { font-weight: 700; font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .show-card .venue { color: var(--text-2); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .show-card .price {
@@ -687,3 +687,22 @@ hr.sep { border: 0; border-top: 0.5px solid var(--border); margin: 4px 0; width:
 
 /* 5 tabs */
 .tab span { font-size: 10.5px; }
+
+/* ---------- Check for shows ---------- */
+.check-list { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+.check-card { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.check-head { display: flex; align-items: center; gap: 12px; }
+.check-head .title { display: block; font-weight: 700; font-size: 17px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.check-head .subtitle { color: var(--muted); font-size: 13px; }
+.check-head .grow { flex: 1; min-width: 0; }
+.check-actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.check-actions .btn { padding: 0 6px; font-size: 13px; min-height: 36px; }
+@media (max-width: 360px) { .check-actions { grid-template-columns: repeat(2, 1fr); } }
+
+/* ---------- Optional settings ---------- */
+details.optional > summary { list-style: none; cursor: pointer; }
+details.optional > summary::-webkit-details-marker { display: none; }
+details.optional > summary b::after { content: " ›"; color: var(--muted); }
+details.optional[open] > summary b::after { content: " ⌄"; }
+details.optional .section-title.sub { margin: 20px 0 8px; }
+details.optional .card { box-shadow: none; background: var(--surface-2); }
